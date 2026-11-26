@@ -1,8 +1,29 @@
-node_modules/
-build/
-dist/
-coverage/
-.DS_Store
-*.log
-.env*
+# Environment & secrets
+.env
+.env.local
+.env.*
 !.env.example
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Dependencies & virtual environments
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+
+# Build outputs
+target/
+dist/
+build/
+.next/
+coverage/
+
+# Local service runtime data (Postgres, Redis, logs)
+data/
+
+# OS metadata
+.DS_Store

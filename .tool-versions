@@ -1,0 +1,6 @@
+# Documentation-only pinned toolchain versions verified in Phase A (asdf is not installed on this host).
+go 1.27.4
+rust 1.100.0
+node 22.23.5
+postgres 15.20
+redis 7.0.15
