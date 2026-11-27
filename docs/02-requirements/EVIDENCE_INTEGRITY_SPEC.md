@@ -42,8 +42,17 @@ Every evidence item, factual assertion, and timeline event stored in the system 
 Every evidence asset (document, photo, audio/text excerpt, diagram) MUST carry exactly one of three License Status values:
 
 ### `PUBLIC_DOMAIN`
-- **What qualifies:** Works of the U.S. federal government (17 U.S.C. § 105 — federal court opinions, DOJ/SEC/FBI press releases, federal indictments/dockets authored by federal officers), works whose copyright term has verifiably expired (historical public-record cases), or works explicitly dedicated to the public domain (e.g., CC0). *Note: Third-party exhibits attached to a federal docket (such as private photographs or bank-authored marketing decks) are NOT automatically public domain solely because they were filed in court and must be evaluated independently.*
-- **Required provenance evidence:** `source_url` (or FOIA/PACER docket reference), `issuing_authority` (or expiration year justification for historical works), and `license_basis_note` stored on the evidence record.
+- **What qualifies:** Works of the U.S. federal government (17 U.S.C. § 105 — federal court opinions, DOJ/SEC/FBI press releases, federal indictments/dockets authored by federal officers), works whose copyright term has verifiably expired (historical public-record cases), or works explicitly dedicated to the public domain (e.g., CC0).
+- **Hard Rule — Third-Party PACER / Docket Exhibits (PO Decision Q5):** Third-party exhibits attached to a federal PACER or court docket (such as private photographs, corporate slide decks, bank emails, or third-party reports filed by litigants) are **NEVER** auto-tagged or permitted as `PUBLIC_DOMAIN` solely because they appear in a court filing. Every third-party docket exhibit MUST be handled strictly through one of three permitted paths:
+  1. **Cited via a Tier 1 court opinion / judicial order** (quoting or referencing the court's own Tier 1 description without republishing the underlying copyrighted exhibit file),
+  2. **`LICENSED`** (with explicit written rights-holder permission archived via a mandatory `license_record_id`), or
+  3. **`RECREATED`** (our own original factual diagram or structured paraphrase created strictly from Tier 1/Tier 2 text, linked via `recreation_source_ids` and watermarked).
+- **Database Enforcement Contract (Phase 06 Schema Requirement):** The `evidence_items` table MUST include a `source_type` column (including `'third_party_exhibit'`) and enforce a database-level `CHECK` constraint that raises a constraint violation whenever `evidence_items.source_type = 'third_party_exhibit' AND license_status = 'PUBLIC_DOMAIN'`:
+  ```sql
+  CONSTRAINT chk_no_public_domain_third_party_exhibit
+    CHECK (NOT (source_type = 'third_party_exhibit' AND license_status = 'PUBLIC_DOMAIN'))
+  ```
+- **Required provenance evidence:** `source_type`, `source_url` (or FOIA/PACER docket reference), `issuing_authority` (or expiration year justification for historical works), and `license_basis_note` stored on the evidence record.
 - **UI display:** Subtle neutral label: `Public Domain (Primary Gov/Court Record)` or `Public Domain (Expired Copyright)` with clickable provenance citation.
 
 ### `LICENSED`
@@ -70,6 +79,7 @@ All 12 combinations (`4 × 3`) are enforced **server-side** (`REQ-004`, `REQ-027
 | **Tier 4**<br>*(Marketing / Bio / Self-Description)* | **ALLOWED WITH HIGH WARNING (Context Exhibit Only).**<br>**Tier 4** badge + `Public Domain` tag + high-visibility warning (*"Self-published claim — unverified"*). Requires paired Tier 1 reference. **Excluded from Official Briefing.** | **ALLOWED WITH HIGH WARNING (Context Exhibit Only).**<br>**Tier 4** badge + `Licensed` credit (`license_record_id` required) + high-visibility warning (*"Self-published claim — unverified"*). **Excluded from Official Briefing.** | **BLOCKED FROM PUBLICATION.**<br>API returns HTTP `422` (`EVIDENCE_POLICY_BLOCKED`). Recreating assets from unverified marketing/bio copy is prohibited. |
 
 *Additional Hard Blocks (independent of matrix cell):*
+- Any item with `source_type = 'third_party_exhibit'` and `license_status = 'PUBLIC_DOMAIN'` -> **BLOCKED AT API (`HTTP 422`) AND POSTGRESQL DB (`CHECK` constraint violation)**.
 - Any item with `license_status = LICENSED` and empty `license_record_id` -> **BLOCKED (`HTTP 422`)**.
 - Any item with `license_status = RECREATED` and empty `recreation_source_ids` -> **BLOCKED (`HTTP 422`)**.
 - Any item lacking `source_citation` or `sha256_hash` -> **BLOCKED (`HTTP 422`)**.
