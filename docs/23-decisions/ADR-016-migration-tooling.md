@@ -37,7 +37,7 @@ We need a repeatable, version-tracked, forward-and-backward SQL migration tool t
 - **Tool:** `golang-migrate` CLI (`v4`) compiled with `-tags 'postgres'` via `scripts/install-migrate.sh` (using `go install`, never `apt-get`).
 - **Naming Convention:** Zero-padded 6-digit sequential pairs: `000001_init.up.sql` / `000001_init.down.sql`, `000002_seed_dev.up.sql` / `000002_seed_dev.down.sql`.
 - **Wrapper Script:** `scripts/migrate.sh` exposing `up`, `down [N]`, `status`, `force <V>`, and `reset` with strict loopback (`127.0.0.1`) host guards mirroring `Makefile` (`ADR-005`).
-- **TODO (Scaffolding Transition):** *"When `backend-go/` is scaffolded, move `migrations/` to `backend-go/migrations/` and update `scripts/migrate.sh` paths accordingly."*
+- **Scaffolding Transition (DONE — Prompt 8b):** Moved `migrations/` to `backend-go/migrations/` via `git mv migrations backend-go/migrations` and updated `scripts/migrate.sh` and `scripts/test-migrations.sh` to target `backend-go/migrations/`.
 
 ### 2. PO-Approved Phase 09 Schema & Seed Resolutions (Locked In)
 - **R1 (Conflict 1 — `Tier 3 × RECREATED` Block):** Keep `chk_no_recreated_tier3_tier4` (`CHECK (NOT (verification_tier IN (3, 4) AND license_status = 'RECREATED'))`) strictly enforced per `DATABASE_DESIGN.md` and `EVIDENCE_INTEGRITY_SPEC.md §3`. Seed the `RECREATED` dev evidence item with `verification_tier = 2` (never `3`).
@@ -46,7 +46,7 @@ We need a repeatable, version-tracked, forward-and-backward SQL migration tool t
   2. `third_party_exhibit` + `LICENSED` + `verification_tier = 2` + `licensing_record_id` FK (proves the legal path for third-party PACER exhibits alongside Q5)
   3. `in_house_recreation` + `RECREATED` + `verification_tier = 2` + non-empty `recreation_source_ids` and `recreation_author_note`
 - **R3 (Conflict 3 — Fixed Dev Admin UUID):** Seed 1 internal `admin_users` row with fixed UUID `'00000000-0000-0000-0000-000000000001'`, email `'admin-test@truecrime.local'`, and an explicit non-authenticating dev-only placeholder hash (`dev seed — cannot authenticate in production`). Reference this UUID across `reviewer_id`, `created_by`, `updated_by`, and `recorded_by` to satisfy `UUID NOT NULL REFERENCES admin_users(id)`.
-- **R4 (Conflict 4 — Migration Path & Publish-Gate Trigger):** Store initial migrations in root `migrations/000001_init.{up,down}.sql` until `backend-go/` is scaffolded (see TODO above). Implement the publish-gate trigger named `enforce_legal_review_before_publish` enforcing all five checks on `NEW.status = 'PUBLISHED'`:
+- **R4 (Conflict 4 — Migration Path & Publish-Gate Trigger):** Initial migrations were created at root `migrations/000001_init.{up,down}.sql` in Prompt 8a and relocated to `backend-go/migrations/` in Prompt 8b (DONE). Implement the publish-gate trigger named `enforce_legal_review_before_publish` enforcing all five checks on `NEW.status = 'PUBLISHED'`:
   1. `NEW.published_legal_review_id IS NOT NULL`
   2. Matching row exists in `legal_review_records` (`id = NEW.published_legal_review_id AND case_id = NEW.id`)
   3. `reviewer_id IS NOT NULL`
@@ -72,7 +72,7 @@ We need a repeatable, version-tracked, forward-and-backward SQL migration tool t
 
 ## Consequences
 
-- `migrations/000001_init.{up,down}.sql` and `migrations/000002_seed_dev.{up,down}.sql` establish the authoritative Phase 09 schema baseline.
+- `backend-go/migrations/000001_init.{up,down}.sql` and `backend-go/migrations/000002_seed_dev.{up,down}.sql` establish the authoritative Phase 09 schema baseline.
 - `docs/24-setup/LOCAL_DEV.md` documents local migration commands under "Database migrations".
 
 ## Reversal Strategy

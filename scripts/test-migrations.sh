@@ -2,11 +2,11 @@
 # =============================================================================
 # scripts/test-migrations.sh — End-to-End PostgreSQL Migration & Constraint Tests
 #
-# Executes tests T1–T16 proving:
+# Executes tests T1–T18 proving:
 #   - Clean forward / backward / forward migration execution
 #   - All 8 core v1.0 tables created and dropped cleanly
 #   - NOT NULL & CHECK constraints on evidence_items (including Q5 & 4x3 matrix)
-#   - Legal-review publication trigger (bidirectional pass & block)
+#   - Legal-review publication trigger (bidirectional pass & block, incl. T17 REJECTED & T18 prohibited_checklist_passed=FALSE)
 #   - Append-only trigger on audit_log (blocks UPDATE and DELETE)
 #   - Immutability trigger on legal_review_records (blocks UPDATE)
 #   - Dev seed migration (000002_seed_dev) applies and rolls back cleanly
@@ -24,6 +24,7 @@ export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"
 export PGHOST="127.0.0.1"
 export PG_HOST="127.0.0.1"
 export DATABASE_URL="${DATABASE_URL:-postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable}"
+export MIGRATIONS_DIR="${ROOT_DIR}/backend-go/migrations"
 
 psql_exec() {
   psql -v ON_ERROR_STOP=1 -X -q -t -A "${DATABASE_URL}" -c "$1"
@@ -55,7 +56,7 @@ assert_sql_fails() {
 }
 
 echo "============================================================================="
-echo "Running Phase 09 Migration & Database Constraint Verification Suite (T1–T16)"
+echo "Running Phase 09 Migration & Database Constraint Verification Suite (T1–T18)"
 echo "============================================================================="
 
 # T1. Start local backing services
@@ -65,6 +66,13 @@ make services-up
 echo "PASS [T1]: Local PostgreSQL 15 and Redis 7 started."
 
 # Ensure clean schema start if a prior local DB already had migrations applied
+EXISTING_SM="$(psql_exec "SELECT CASE WHEN to_regclass('public.schema_migrations') IS NOT NULL THEN (SELECT COALESCE(MAX(version), 0) FROM schema_migrations) ELSE 0 END;")"
+if [[ "${EXISTING_SM}" != "0" ]]; then
+  echo ""
+  echo "--- [Pre-T2] Detected existing schema_migrations version=${EXISTING_SM}; rolling back to clean state ---"
+  bash scripts/migrate.sh down "${EXISTING_SM}"
+fi
+
 echo ""
 echo "--- [T2] bash scripts/migrate.sh up 1 (apply 000001_init.up.sql) ---"
 bash scripts/migrate.sh up 1
@@ -309,6 +317,125 @@ WHERE slug = 'test-case-no-review';
 # Clean up temporary T16d case so down migration can delete admin_users cleanly
 psql_exec "DELETE FROM cases WHERE id = '92000000-0000-0000-0000-000000000001';"
 
+# T17. REJECTED legal review MUST block publish (trigger exception)
+echo ""
+echo "--- [T17] Publish case linked to REJECTED legal review (expect trigger exception) ---"
+psql_exec "
+INSERT INTO cases (id, slug, title, category, jurisdiction, status, official_briefing, genuine_gaps, created_by, updated_by)
+VALUES (
+  '93000000-0000-0000-0000-000000000001',
+  'test-case-rejected',
+  'Rejected Legal Review Case — Must Block Publish',
+  'financial_crime',
+  'US-FEDERAL',
+  'DRAFT',
+  'Draft briefing for T17 rejected legal review test',
+  '[{\"claim\":\"Pending filing\",\"why_unverified\":\"Awaiting counsel clearance\",\"highest_available_tier\":\"None\"}]'::jsonb,
+  '00000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000001'
+);
+INSERT INTO legal_review_records (
+  id, case_id, reviewer_id, external_counsel_ref, decision,
+  prohibited_checklist_passed, genuine_gaps_verified, license_audit_passed, notes, reviewed_at
+) VALUES (
+  '93000000-0000-0000-0000-000000000002',
+  '93000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000001',
+  'COUNSEL-T17-REJECTED',
+  'REJECTED',
+  TRUE,
+  TRUE,
+  TRUE,
+  'Counsel rejected publication due to defamation risk.',
+  NOW()
+);
+UPDATE cases
+SET published_legal_review_id = '93000000-0000-0000-0000-000000000002'
+WHERE id = '93000000-0000-0000-0000-000000000001';
+"
+assert_sql_fails "T17" "no APPROVED legal_review_records row" "
+UPDATE cases
+SET status = 'PUBLISHED'
+WHERE slug = 'test-case-rejected';
+"
+# Cleanup T17 rows (DELETE on legal_review_records is permitted; only UPDATE is blocked)
+psql_exec "
+UPDATE cases SET published_legal_review_id = NULL WHERE id = '93000000-0000-0000-0000-000000000001';
+DELETE FROM legal_review_records WHERE id = '93000000-0000-0000-0000-000000000002';
+DELETE FROM cases WHERE id = '93000000-0000-0000-0000-000000000001';
+"
+echo "PASS [T17-cleanup]: Cleaned up temporary T17 case and REJECTED legal_review_records row."
+
+# T18. prohibited_checklist_passed=FALSE MUST block publish (both CHECK & trigger layers)
+echo ""
+echo "--- [T18] prohibited_checklist_passed=FALSE blocks APPROVED insert (CHECK) and publish (trigger) ---"
+psql_exec "
+INSERT INTO cases (id, slug, title, category, jurisdiction, status, official_briefing, genuine_gaps, created_by, updated_by)
+VALUES (
+  '94000000-0000-0000-0000-000000000001',
+  'test-case-prohibited-fail',
+  'Prohibited Checklist Failed Case — Must Block Publish',
+  'financial_crime',
+  'US-FEDERAL',
+  'DRAFT',
+  'Draft briefing for T18 prohibited checklist test',
+  '[{\"claim\":\"Unverified exhibit\",\"why_unverified\":\"Prohibited checklist incomplete\",\"highest_available_tier\":\"None\"}]'::jsonb,
+  '00000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000001'
+);
+"
+# T18a: Direct insert with decision='APPROVED' and prohibited_checklist_passed=FALSE is blocked by CHECK constraint
+assert_sql_fails "T18a-check" "chk_legal_review_approved_complete" "
+INSERT INTO legal_review_records (
+  id, case_id, reviewer_id, external_counsel_ref, decision,
+  prohibited_checklist_passed, genuine_gaps_verified, license_audit_passed, notes, reviewed_at
+) VALUES (
+  '94000000-0000-0000-0000-000000000002',
+  '94000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000001',
+  'COUNSEL-T18-PROHIBITED',
+  'APPROVED',
+  FALSE,
+  TRUE,
+  TRUE,
+  'Attempted APPROVED review without passing prohibited content checklist.',
+  NOW()
+);
+"
+# T18b: Review row with prohibited_checklist_passed=FALSE linked to case is ALSO blocked at publish by trigger
+psql_exec "
+INSERT INTO legal_review_records (
+  id, case_id, reviewer_id, external_counsel_ref, decision,
+  prohibited_checklist_passed, genuine_gaps_verified, license_audit_passed, notes, reviewed_at
+) VALUES (
+  '94000000-0000-0000-0000-000000000003',
+  '94000000-0000-0000-0000-000000000001',
+  '00000000-0000-0000-0000-000000000001',
+  'COUNSEL-T18-PROHIBITED',
+  'CHANGES_REQUESTED',
+  FALSE,
+  TRUE,
+  TRUE,
+  'Prohibited content checklist failed; changes requested.',
+  NOW()
+);
+UPDATE cases
+SET published_legal_review_id = '94000000-0000-0000-0000-000000000003'
+WHERE id = '94000000-0000-0000-0000-000000000001';
+"
+assert_sql_fails "T18b-trigger" "prohibited_checklist_passed=TRUE" "
+UPDATE cases
+SET status = 'PUBLISHED'
+WHERE slug = 'test-case-prohibited-fail';
+"
+# Cleanup T18 rows
+psql_exec "
+UPDATE cases SET published_legal_review_id = NULL WHERE id = '94000000-0000-0000-0000-000000000001';
+DELETE FROM legal_review_records WHERE id = '94000000-0000-0000-0000-000000000003';
+DELETE FROM cases WHERE id = '94000000-0000-0000-0000-000000000001';
+"
+echo "PASS [T18-cleanup]: Cleaned up temporary T18 case and legal_review_records row."
+
 # T11. Roll back both migrations (down 2)
 echo ""
 echo "--- [T11] bash scripts/migrate.sh down 2 ---"
@@ -347,5 +474,5 @@ echo "PASS [T14]: Local PostgreSQL and Redis stopped cleanly."
 
 echo ""
 echo "============================================================================="
-echo "ALL MIGRATION & CONSTRAINT TESTS (T1–T16) PASSED!"
+echo "ALL MIGRATION & CONSTRAINT TESTS (T1–T18) PASSED!"
 echo "============================================================================="

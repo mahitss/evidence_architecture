@@ -132,7 +132,7 @@ export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.cargo/bin:$PATH"
 
 ### Run Migrations Locally
 
-Start PostgreSQL first (`make services-up`), then use `scripts/migrate.sh` (defaults to `postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable` and refuses any non-`127.0.0.1` host):
+Migrations live in `backend-go/migrations/` (moved from root `migrations/` per `ADR-016`). Start PostgreSQL first (`make services-up`), then use `scripts/migrate.sh` (defaults to `postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable` and refuses any non-`127.0.0.1` host):
 
 ```bash
 bash scripts/migrate.sh up          # Apply all pending migrations
@@ -144,11 +144,68 @@ bash scripts/migrate.sh force <V>   # Force version V to recover dirty state
 bash scripts/migrate.sh reset       # Roll back all then re-apply all (prompts for 'yes')
 ```
 
-### Verify All Schema Constraints & Triggers (`T1`–`T16`)
+### Verify All Schema Constraints & Triggers (`T1`–`T18`)
 
-Run the end-to-end migration and database invariant test suite (starts local services, verifies all 8 tables, tests Q5 `CHECK` constraint, `NOT NULL`, `chk_no_recreated_tier3_tier4`, bidirectional legal-review publish trigger, append-only `audit_log`, immutable `legal_review_records`, full rollback + re-apply, and stops local services):
+Run the end-to-end migration and database invariant test suite (starts local services, verifies all 8 tables, tests Q5 `CHECK` constraint, `NOT NULL`, `chk_no_recreated_tier3_tier4`, bidirectional legal-review publish trigger including `T17` rejected review & `T18` `prohibited_checklist_passed=FALSE`, append-only `audit_log`, immutable `legal_review_records`, full rollback + re-apply, and stops local services):
 
 ```bash
 bash scripts/test-migrations.sh
 ```
+
+---
+
+## 8. Running the Go API
+
+`backend-go/` depends on PostgreSQL 15 running locally with schema migrations applied from `backend-go/migrations/`.
+
+### Required Environment Variables
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `DATABASE_URL` | **Yes** | — | Must use `127.0.0.1` host locally (e.g. `postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable`); startup refuses non-`127.0.0.1` hosts |
+| `JWT_SECRET` | **Yes** | — | Minimum 32 characters (HS256 signing key; never commit real secrets) |
+| `LISTEN_ADDR` | **Yes** | — | Bind address (e.g. `127.0.0.1:8080`) |
+| `LOG_LEVEL` | No | `info` | Zerolog level (`debug`, `info`, `warn`, `error`) |
+| `JWT_TTL` | No | `60m` | Admin Bearer JWT lifetime |
+| `PORT` | No | `8080` | Optional port metadata (`1`–`65535`) |
+
+### Start Locally
+
+```bash
+export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
+make services-up
+bash scripts/migrate.sh up
+
+cd backend-go
+DATABASE_URL="postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable" \
+JWT_SECRET="replace-with-local-dev-secret-at-least-32-chars" \
+LISTEN_ADDR="127.0.0.1:8080" \
+go run cmd/api/main.go
+```
+
+### Expected Startup & Health Output
+
+```text
+{"level":"info","listen_addr":"127.0.0.1:8080","log_level":"info","time":"...","message":"starting backend-go api"}
+{"level":"info","addr":"127.0.0.1:8080","version":"0.1.0","time":"...","message":"http_server_listening"}
+```
+
+Verify in a second terminal:
+
+```bash
+curl -s http://127.0.0.1:8080/health
+# Expected: {"status":"ok","db":"ok","version":"0.1.0"}
+```
+
+### Run Unit & Integration Tests
+
+```bash
+make services-up
+bash scripts/migrate.sh up
+cd backend-go
+go test ./... -race -count=1
+go vet ./...
+gofmt -l .
+```
+
 

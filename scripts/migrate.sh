@@ -19,7 +19,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-MIGRATIONS_DIR="${MIGRATIONS_DIR:-${ROOT_DIR}/migrations}"
+MIGRATIONS_DIR="${MIGRATIONS_DIR:-${ROOT_DIR}/backend-go/migrations}"
 
 export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"
 
