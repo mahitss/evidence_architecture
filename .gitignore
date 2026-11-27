@@ -2,9 +2,11 @@
 .env
 .env.local
 .env.*
+.env.path
 !.env.example
 *.pem
 *.key
+*.git-credentials
 
 # Logs
 *.log

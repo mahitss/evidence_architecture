@@ -1,1 +1,1 @@
-Go API — not yet scaffolded. See docs/06-architecture/.
+Go API — not yet scaffolded. See docs/05-architecture/.

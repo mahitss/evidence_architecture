@@ -1,10 +1,19 @@
-# Local development Makefile — True Crime Investigation App
-# NOTE: All defaults below (trust auth, localhost ports, local data dirs) are
-# strictly for LOCAL DEVELOPMENT ONLY and are NOT for production use.
-
 SHELL := /bin/bash
 .SHELLFLAGS := -euo pipefail -c
+# =========================================================
+# LOCAL DEVELOPMENT ONLY
+# This Makefile runs Postgres (port 5432) and Redis (port 6379)
+# on 127.0.0.1 with trust authentication. NEVER expose these
+# ports outside localhost. NEVER use this configuration in
+# staging, production, or any shared environment. For any
+# non-local environment, use scram-sha-256 auth, TLS, and
+# network isolation.
+# =========================================================
 .DEFAULT_GOAL := help
+
+# run_as() execution model (used by services-up, services-down, services-status, db-reset):
+#   - Branch 1: current user is root (id -u == 0) -> su to $(SVC_USER) to run command
+#   - Branch 2: current user is non-root (id -u != 0) -> run command directly as current user (CI parity)
 
 # Ensure verified Go 1.27.4 and rustup Cargo/Rustc resolve ahead of system /usr/bin
 export PATH := /usr/local/go/bin:$(HOME)/.cargo/bin:$(PATH)
@@ -14,6 +23,7 @@ PG_BIN      := /usr/lib/postgresql/15/bin
 PG_DATA     := $(DATA_DIR)/pgdata
 PG_RUN      := $(DATA_DIR)/pgrun
 PG_LOG      := $(DATA_DIR)/logs/postgres.log
+PG_HOST     ?= 127.0.0.1
 PG_PORT     ?= 5432
 PG_USER     ?= postgres
 PG_DB       ?= truecrime_dev
@@ -21,6 +31,7 @@ PG_DB       ?= truecrime_dev
 REDIS_DATA  := $(DATA_DIR)/redis
 REDIS_LOG   := $(DATA_DIR)/logs/redis.log
 REDIS_PID   := $(DATA_DIR)/redis/redis.pid
+REDIS_HOST  ?= 127.0.0.1
 REDIS_PORT  ?= 6379
 
 SVC_USER    ?= appuser
@@ -74,12 +85,29 @@ env-check: ## Verify PATH ordering and pinned toolchain versions
 	@echo "OK: All required local toolchains verified."
 
 services-up: ## Start PostgreSQL and Redis directly as $(SVC_USER) (local dev only)
+	@echo "==> Enforcing local-dev-only loopback and port guards..."
+	@if [[ "$(PG_HOST)" != "127.0.0.1" ]] || [[ -n "$${PGHOST:-}" && "$${PGHOST}" != "127.0.0.1" ]]; then \
+		echo "ERROR: Refusing to start PostgreSQL with trust auth on non-loopback host (PG_HOST='$(PG_HOST)', PGHOST='$${PGHOST:-unset}'). Must be 127.0.0.1." >&2; \
+		exit 1; \
+	fi
+	@if [[ "$(PG_PORT)" != "5432" ]] || [[ -n "$${PGPORT:-}" && "$${PGPORT}" != "5432" ]]; then \
+		echo "ERROR: Refusing to start PostgreSQL on non-standard local dev port (PG_PORT='$(PG_PORT)', PGPORT='$${PGPORT:-unset}'). Must be 5432." >&2; \
+		exit 1; \
+	fi
+	@if [[ "$(REDIS_HOST)" != "127.0.0.1" ]]; then \
+		echo "ERROR: Refusing to start unauthenticated Redis on non-loopback host (REDIS_HOST='$(REDIS_HOST)'). Must be 127.0.0.1." >&2; \
+		exit 1; \
+	fi
+	@if [[ "$(REDIS_PORT)" != "6379" ]]; then \
+		echo "ERROR: Refusing to start Redis on non-standard local dev port (REDIS_PORT='$(REDIS_PORT)'). Must be 6379." >&2; \
+		exit 1; \
+	fi
 	@echo "==> Ensuring local data and log directories under $(DATA_DIR)..."
 	@mkdir -p "$(PG_DATA)" "$(PG_RUN)" "$(DATA_DIR)/logs" "$(REDIS_DATA)"
 	@if [[ "$$(id -u)" -eq 0 ]]; then \
 		chown -R "$(SVC_USER):$(SVC_USER)" "$(DATA_DIR)"; \
 	fi
-	@echo "==> Starting PostgreSQL 15 on 127.0.0.1:$(PG_PORT)..."
+	@echo "==> Starting PostgreSQL 15 on $(PG_HOST):$(PG_PORT)..."
 	@run_as() { \
 		if [[ "$$(id -u)" -eq 0 ]]; then \
 			su -s /bin/bash "$(SVC_USER)" -c "$$1"; \
@@ -94,28 +122,28 @@ services-up: ## Start PostgreSQL and Redis directly as $(SVC_USER) (local dev on
 	if run_as "'$(PG_BIN)/pg_ctl' -D '$(PG_DATA)' status" >/dev/null 2>&1; then \
 		echo "PostgreSQL is already running."; \
 	else \
-		run_as "'$(PG_BIN)/pg_ctl' -D '$(PG_DATA)' -l '$(PG_LOG)' -o '-k $(PG_RUN) -h 127.0.0.1 -p $(PG_PORT)' start"; \
+		run_as "'$(PG_BIN)/pg_ctl' -D '$(PG_DATA)' -l '$(PG_LOG)' -o '-k $(PG_RUN) -h $(PG_HOST) -p $(PG_PORT)' start"; \
 	fi; \
-	if ! run_as "psql -h 127.0.0.1 -p '$(PG_PORT)' -U '$(PG_USER)' -tAc \"SELECT 1 FROM pg_database WHERE datname='$(PG_DB)'\"" | grep -qx 1; then \
+	if ! run_as "psql -h '$(PG_HOST)' -p '$(PG_PORT)' -U '$(PG_USER)' -tAc \"SELECT 1 FROM pg_database WHERE datname='$(PG_DB)'\"" | grep -qx 1; then \
 		echo "Creating local dev database '$(PG_DB)'..."; \
-		run_as "'$(PG_BIN)/createdb' -h 127.0.0.1 -p '$(PG_PORT)' -U '$(PG_USER)' '$(PG_DB)'"; \
+		run_as "'$(PG_BIN)/createdb' -h '$(PG_HOST)' -p '$(PG_PORT)' -U '$(PG_USER)' '$(PG_DB)'"; \
 	fi
-	@echo "==> Starting Redis 7 on 127.0.0.1:$(REDIS_PORT)..."
-	@if redis-cli -h 127.0.0.1 -p "$(REDIS_PORT)" ping >/dev/null 2>&1; then \
+	@echo "==> Starting Redis 7 on $(REDIS_HOST):$(REDIS_PORT)..."
+	@if redis-cli -h "$(REDIS_HOST)" -p "$(REDIS_PORT)" ping >/dev/null 2>&1; then \
 		echo "Redis is already running."; \
 	else \
 		if [[ "$$(id -u)" -eq 0 ]]; then \
-			su -s /bin/bash "$(SVC_USER)" -c "redis-server --daemonize yes --bind 127.0.0.1 --port '$(REDIS_PORT)' --dir '$(REDIS_DATA)' --pidfile '$(REDIS_PID)' --logfile '$(REDIS_LOG)'"; \
+			su -s /bin/bash "$(SVC_USER)" -c "redis-server --daemonize yes --bind '$(REDIS_HOST)' --port '$(REDIS_PORT)' --dir '$(REDIS_DATA)' --pidfile '$(REDIS_PID)' --logfile '$(REDIS_LOG)'"; \
 		else \
-			redis-server --daemonize yes --bind 127.0.0.1 --port "$(REDIS_PORT)" --dir "$(REDIS_DATA)" --pidfile "$(REDIS_PID)" --logfile "$(REDIS_LOG)"; \
+			redis-server --daemonize yes --bind "$(REDIS_HOST)" --port "$(REDIS_PORT)" --dir "$(REDIS_DATA)" --pidfile "$(REDIS_PID)" --logfile "$(REDIS_LOG)"; \
 		fi; \
 		for i in 1 2 3 4 5 6 7 8 9 10; do \
-			if redis-cli -h 127.0.0.1 -p "$(REDIS_PORT)" ping >/dev/null 2>&1; then break; fi; \
+			if redis-cli -h "$(REDIS_HOST)" -p "$(REDIS_PORT)" ping >/dev/null 2>&1; then break; fi; \
 			sleep 0.2; \
 		done; \
-		redis-cli -h 127.0.0.1 -p "$(REDIS_PORT)" ping | grep -qx PONG; \
+		redis-cli -h "$(REDIS_HOST)" -p "$(REDIS_PORT)" ping | grep -qx PONG; \
 	fi
-	@echo "OK: Local PostgreSQL ($(PG_PORT)) and Redis ($(REDIS_PORT)) are up."
+	@echo "OK: Local PostgreSQL ($(PG_HOST):$(PG_PORT)) and Redis ($(REDIS_HOST):$(REDIS_PORT)) are up."
 
 services-down: ## Stop local PostgreSQL and Redis gracefully
 	@echo "==> Stopping PostgreSQL..."
@@ -173,13 +201,22 @@ services-status: ## Show PostgreSQL and Redis status (exits non-zero if either i
 	echo "OK: Both PostgreSQL and Redis are running."
 
 db-reset: ## Drop and recreate local dev database ($(PG_DB)) with confirmation prompt
+	@echo "==> Enforcing local-dev-only loopback and port guards for db-reset..."
+	@if [[ "$(PG_HOST)" != "127.0.0.1" ]] || [[ -n "$${PGHOST:-}" && "$${PGHOST}" != "127.0.0.1" ]]; then \
+		echo "ERROR: Refusing to reset PostgreSQL on non-loopback host (PG_HOST='$(PG_HOST)', PGHOST='$${PGHOST:-unset}'). Must be 127.0.0.1." >&2; \
+		exit 1; \
+	fi
+	@if [[ "$(PG_PORT)" != "5432" ]] || [[ -n "$${PGPORT:-}" && "$${PGPORT}" != "5432" ]]; then \
+		echo "ERROR: Refusing to reset PostgreSQL on non-standard local dev port (PG_PORT='$(PG_PORT)', PGPORT='$${PGPORT:-unset}'). Must be 5432." >&2; \
+		exit 1; \
+	fi
 	@echo "==> Requesting confirmation to reset local dev database '$(PG_DB)'..."
 	@read -r -p "This will DROP and RECREATE local dev database '$(PG_DB)'. Type 'yes' to continue: " ans; \
 	if [[ "$$ans" != "yes" ]]; then \
 		echo "Aborted database reset." >&2; \
 		exit 1; \
 	fi
-	@echo "==> Dropping and recreating '$(PG_DB)' on 127.0.0.1:$(PG_PORT)..."
+	@echo "==> Dropping and recreating '$(PG_DB)' on $(PG_HOST):$(PG_PORT)..."
 	@run_as() { \
 		if [[ "$$(id -u)" -eq 0 ]]; then \
 			su -s /bin/bash "$(SVC_USER)" -c "$$1"; \
@@ -187,8 +224,8 @@ db-reset: ## Drop and recreate local dev database ($(PG_DB)) with confirmation p
 			bash -c "$$1"; \
 		fi; \
 	}; \
-	run_as "'$(PG_BIN)/dropdb' --if-exists -h 127.0.0.1 -p '$(PG_PORT)' -U '$(PG_USER)' '$(PG_DB)'"; \
-	run_as "'$(PG_BIN)/createdb' -h 127.0.0.1 -p '$(PG_PORT)' -U '$(PG_USER)' '$(PG_DB)'"
+	run_as "'$(PG_BIN)/dropdb' --if-exists -h '$(PG_HOST)' -p '$(PG_PORT)' -U '$(PG_USER)' '$(PG_DB)'"; \
+	run_as "'$(PG_BIN)/createdb' -h '$(PG_HOST)' -p '$(PG_PORT)' -U '$(PG_USER)' '$(PG_DB)'"
 	@echo "OK: Local dev database '$(PG_DB)' has been reset."
 
 clean: ## Remove build artifacts without deleting ./data/

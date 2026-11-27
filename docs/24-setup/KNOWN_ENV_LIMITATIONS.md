@@ -54,3 +54,14 @@ This document records verified constraints of the current sandboxed development 
 
 - **Fact:** Sending an HTTP `HEAD` request (`curl -I https://crates.io`) returns `HTTP/2 403`. However, Cargo's sparse registry endpoint (`https://index.crates.io/config.json`) returns `HTTP/2 200`, and live crate downloads (`cargo check` with `serde`) succeed cleanly.
 - **Mitigation:** Do not use `HEAD` probes against `https://crates.io` to test Rust registry connectivity. Use Cargo's default sparse index protocol (`index.crates.io`) or test via `curl -I https://index.crates.io/config.json`.
+
+---
+
+## 7. Ephemeral Container Root-FS & `git credential.helper store` (Local Sandbox Only)
+
+- **Fact:** On idle container recycle, files under `/app/applet` persist, while `/app/applet/.git/`, `/root/.gitconfig`, `/root/.git-credentials`, and OS-level installs (`/usr/local/go`, `/root/.cargo`, `/usr/lib/postgresql/15/bin`, `/usr/bin/redis-server`) are wiped. To enable non-interactive pushes to the remote GitHub repository (now the source of truth), this sandbox configures `git config --global credential.helper store`, which writes credentials in **plaintext** to `~/.git-credentials`.
+- **Mitigation / Policy:**
+  - `credential.helper store` is a **local-sandbox-only** decision, acceptable solely because this container is single-tenant and its root filesystem is wiped on recycle.
+  - **NEVER** use `git config --global credential.helper store` on a shared, persistent, or production host; use short-lived OAuth tokens, OS keychains, or SSH keys with passphrases instead.
+  - Always rotate any Personal Access Token (PAT) pasted during interactive setup, and keep `*.git-credentials` in `.gitignore` as defense in depth.
+  - Run `bash scripts/bootstrap-env.sh` at the start of any session after a container recycle.
