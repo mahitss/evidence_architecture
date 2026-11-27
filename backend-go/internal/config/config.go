@@ -13,18 +13,22 @@ import (
 )
 
 const (
-	MinJWTSecretLength     = 32
-	DefaultLogLevel        = "info"
-	DefaultJWTTTL          = 60 * time.Minute
-	DefaultPort            = "8080"
-	DefaultVersion         = "0.1.0"
-	DefaultLoginRatePerMin = 5
-	RequiredLoopbackPGHost = "127.0.0.1"
+	MinJWTSecretLength      = 32
+	DefaultLogLevel         = "info"
+	DefaultJWTTTL           = 60 * time.Minute
+	DefaultPort             = "8080"
+	DefaultVersion          = "0.1.0"
+	DefaultLoginRatePerMin  = 5
+	DefaultRedisURL         = "redis://127.0.0.1:6379/0"
+	DefaultLocalStorageRoot = "./data/evidence"
+	RequiredLoopbackHost    = "127.0.0.1"
 )
 
 // Config holds immutable runtime configuration validated at startup.
 type Config struct {
 	DatabaseURL          string
+	RedisURL             string
+	LocalStorageRoot     string
 	JWTSecret            string
 	ListenAddr           string
 	LogLevel             string
@@ -53,6 +57,18 @@ func LoadFromLookup(lookup func(string) string) (Config, error) {
 		errs = append(errs, "DATABASE_URL is required")
 	} else if err := validateLoopbackDatabaseURL(dbURL); err != nil {
 		errs = append(errs, err.Error())
+	}
+
+	redisURL := strings.TrimSpace(lookup("REDIS_URL"))
+	if redisURL == "" {
+		redisURL = DefaultRedisURL
+	} else if err := ValidateLoopbackRedisURL(redisURL); err != nil {
+		errs = append(errs, err.Error())
+	}
+
+	localStorageRoot := strings.TrimSpace(lookup("LOCAL_STORAGE_ROOT"))
+	if localStorageRoot == "" {
+		localStorageRoot = DefaultLocalStorageRoot
 	}
 
 	jwtSecret := lookup("JWT_SECRET")
@@ -118,6 +134,8 @@ func LoadFromLookup(lookup func(string) string) (Config, error) {
 
 	return Config{
 		DatabaseURL:          dbURL,
+		RedisURL:             redisURL,
+		LocalStorageRoot:     localStorageRoot,
 		JWTSecret:            jwtSecret,
 		ListenAddr:           listenAddr,
 		LogLevel:             logLevel,
@@ -137,8 +155,24 @@ func validateLoopbackDatabaseURL(rawURL string) error {
 		return fmt.Errorf("DATABASE_URL scheme %q must be postgres or postgresql", parsed.Scheme)
 	}
 	host := parsed.Hostname()
-	if host != RequiredLoopbackPGHost {
-		return fmt.Errorf("refusing to start: DATABASE_URL host %q must be %s (local loopback guard)", host, RequiredLoopbackPGHost)
+	if host != RequiredLoopbackHost {
+		return fmt.Errorf("refusing to start: DATABASE_URL host %q must be %s (local loopback guard)", host, RequiredLoopbackHost)
+	}
+	return nil
+}
+
+// ValidateLoopbackRedisURL enforces that REDIS_URL targets 127.0.0.1 locally.
+func ValidateLoopbackRedisURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("REDIS_URL is not a valid URL: %w", err)
+	}
+	if parsed.Scheme != "redis" && parsed.Scheme != "rediss" {
+		return fmt.Errorf("REDIS_URL scheme %q must be redis or rediss", parsed.Scheme)
+	}
+	host := parsed.Hostname()
+	if host != RequiredLoopbackHost {
+		return fmt.Errorf("refusing to connect: REDIS_URL host %q must be %s (local loopback guard)", host, RequiredLoopbackHost)
 	}
 	return nil
 }

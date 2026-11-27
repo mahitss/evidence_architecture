@@ -165,6 +165,8 @@ bash scripts/test-migrations.sh
 | `DATABASE_URL` | **Yes** | — | Must use `127.0.0.1` host locally (e.g. `postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable`); startup refuses non-`127.0.0.1` hosts |
 | `JWT_SECRET` | **Yes** | — | Minimum 32 characters (HS256 signing key; never commit real secrets) |
 | `LISTEN_ADDR` | **Yes** | — | Bind address (e.g. `127.0.0.1:8080`) |
+| `REDIS_URL` | No | `redis://127.0.0.1:6379/0` | Redis Streams queue URL; startup refuses non-`127.0.0.1` hosts |
+| `LOCAL_STORAGE_ROOT` | No | `./data/evidence` | Local filesystem root for S3-compatible `LocalStorage` driver |
 | `LOG_LEVEL` | No | `info` | Zerolog level (`debug`, `info`, `warn`, `error`) |
 | `JWT_TTL` | No | `60m` | Admin Bearer JWT lifetime |
 | `PORT` | No | `8080` | Optional port metadata (`1`–`65535`) |
@@ -178,6 +180,8 @@ bash scripts/migrate.sh up
 
 cd backend-go
 DATABASE_URL="postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable" \
+REDIS_URL="redis://127.0.0.1:6379/0" \
+LOCAL_STORAGE_ROOT="../data/evidence" \
 JWT_SECRET="replace-with-local-dev-secret-at-least-32-chars" \
 LISTEN_ADDR="127.0.0.1:8080" \
 go run cmd/api/main.go
@@ -203,9 +207,137 @@ curl -s http://127.0.0.1:8080/health
 make services-up
 bash scripts/migrate.sh up
 cd backend-go
-go test ./... -race -count=1
+staticcheck ./...
 go vet ./...
 gofmt -l .
+go test ./... -race -count=1
+go build ./cmd/api && rm -f ./api
 ```
+
+---
+
+## 9. Admin write workflow
+
+With the Go API running on `http://127.0.0.1:8080`, PostgreSQL (`127.0.0.1:5432`), and Redis (`127.0.0.1:6379`) started via `make services-up`, every admin write endpoint requires a Bearer JWT from `POST /api/v1/admin/login` and records a row in `audit_log` inside the same database transaction.
+
+### 9.1 Login (obtain admin JWT)
+
+> Note: The dev seed admin (`admin-test@truecrime.local`) ships with an intentionally non-authenticating placeholder hash (`000002_seed_dev.up.sql`). In local dev, update its Argon2id hash or create a local dev admin before logging in.
+
+```bash
+TOKEN=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/admin/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"admin-test@truecrime.local","password":"your-local-dev-password"}' \
+  | jq -r '.token')
+```
+
+### 9.2 Create a DRAFT case
+
+```bash
+CASE_ID=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/admin/cases \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "slug": "us-sec-demo-2026",
+    "title": "United States v. Demo Financial Corp.",
+    "category": "financial_crime",
+    "jurisdiction": "US-SDNY",
+    "official_briefing": "Summary based on DOJ press release and federal indictment.",
+    "genuine_gaps": [{"question": "Beneficial owner of offshore shell remains unconfirmed in public filings."}]
+  }' | jq -r '.id')
+echo "Created CASE_ID=$CASE_ID"
+```
+
+### 9.3 Update a DRAFT / IN_REVIEW case
+
+Editing an `APPROVED` or `PUBLISHED` case returns `409 Conflict` (`"Case must be retracted to DRAFT to edit."`).
+
+```bash
+curl -sS -X PUT "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "United States v. Demo Financial Corp. (Amended)"}' | jq .
+```
+
+### 9.4 Upload valid evidence (`202 Accepted` + Redis Stream `evidence.process`)
+
+```bash
+printf 'Federal court exhibit text\n' > /tmp/sample-exhibit.txt
+
+EVIDENCE_ID=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/evidence" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'file=@/tmp/sample-exhibit.txt;type=text/plain' \
+  -F 'title=DOJ Press Release Exhibit A' \
+  -F 'source_type=gov_primary_record' \
+  -F 'rights_status=PUBLIC_DOMAIN' \
+  -F 'verification_tier=1' \
+  -F 'provenance_citation=US DOJ SDNY Press Release 26-001' \
+  -F 'provenance_url=https://www.justice.gov/usao-sdny/pr/demo' \
+  -F 'redaction_status=NOT_REQUIRED' \
+  | tee /dev/stderr | jq -r '.evidence_id')
+# Expected HTTP 202: {"evidence_id":"...","processing_status":"PENDING","job_published":true,"sha256_hash":"...","storage_key":"..."}
+```
+
+### 9.5 Q5 rejection example (`400 Bad Request` — fails fast before DB)
+
+Uploading a `third_party_exhibit` marked as `PUBLIC_DOMAIN` violates the Q5 evidence integrity policy and is rejected immediately with HTTP `400` without writing to storage, PostgreSQL, or Redis:
+
+```bash
+curl -i -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/evidence" \
+  -H "Authorization: Bearer $TOKEN" \
+  -F 'file=@/tmp/sample-exhibit.txt;type=text/plain' \
+  -F 'title=Illegal Public Domain Claim' \
+  -F 'source_type=third_party_exhibit' \
+  -F 'rights_status=PUBLIC_DOMAIN' \
+  -F 'verification_tier=2' \
+  -F 'provenance_citation=Unlicensed third-party media'
+# Expected HTTP 400: {"error":{"code":"BAD_REQUEST","message":"third_party_exhibit cannot have rights_status=PUBLIC_DOMAIN (Q5 policy)","request_id":"..."}}
+```
+
+### 9.6 Update evidence metadata
+
+```bash
+curl -sS -X PUT "http://127.0.0.1:8080/api/v1/admin/evidence/$EVIDENCE_ID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"prohibited_content_cleared": true}' | jq .
+```
+
+*(Note: Updating evidence on an already `PUBLISHED` case automatically demotes the case to `IN_REVIEW` and clears `published_legal_review_id`, requiring a fresh legal review before republishing.)*
+
+### 9.7 Record legal review
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/legal-review" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "decision": "APPROVED",
+    "defamation_check_passed": true,
+    "privacy_check_passed": true,
+    "copyright_check_passed": true,
+    "prohibited_checklist_passed": true,
+    "notes": "Verified primary government provenance and prohibited checklist."
+  }' | jq .
+```
+
+### 9.8 Publish case (enforced by PostgreSQL trigger)
+
+All evidence items must have `processing_status='COMPLETED'` (set by the Rust processor in Prompt 8d) and `prohibited_content_cleared=true`, and the case must have an `APPROVED` legal review and at least one entry in `genuine_gaps`. Otherwise PostgreSQL trigger `enforce_legal_review_before_publish` rejects the update and the API returns `422 Unprocessable Entity` with the exact PostgreSQL message.
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/publish" \
+  -H "Authorization: Bearer $TOKEN" | jq .
+```
+
+### 9.9 Retract a published case
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/retract" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"reason": "Pending court-ordered seal verification"}' | jq .
+```
+
 
 

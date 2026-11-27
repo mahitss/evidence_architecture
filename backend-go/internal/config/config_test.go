@@ -31,6 +31,8 @@ func TestLoadFromLookup(t *testing.T) {
 			wantErr: false,
 			check: func(t *testing.T, cfg Config) {
 				assert.Equal(t, validDBURL, cfg.DatabaseURL)
+				assert.Equal(t, DefaultRedisURL, cfg.RedisURL)
+				assert.Equal(t, DefaultLocalStorageRoot, cfg.LocalStorageRoot)
 				assert.Equal(t, validSecret, cfg.JWTSecret)
 				assert.Equal(t, "127.0.0.1:8080", cfg.ListenAddr)
 				assert.Equal(t, DefaultLogLevel, cfg.LogLevel)
@@ -43,6 +45,8 @@ func TestLoadFromLookup(t *testing.T) {
 			name: "valid custom optional overrides",
 			env: map[string]string{
 				"DATABASE_URL":             "postgresql://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable",
+				"REDIS_URL":                "redis://127.0.0.1:6379/2",
+				"LOCAL_STORAGE_ROOT":       "/tmp/evidence-custom",
 				"JWT_SECRET":               validSecret + "extra",
 				"LISTEN_ADDR":              "127.0.0.1:9090",
 				"LOG_LEVEL":                "debug",
@@ -53,6 +57,8 @@ func TestLoadFromLookup(t *testing.T) {
 			},
 			wantErr: false,
 			check: func(t *testing.T, cfg Config) {
+				assert.Equal(t, "redis://127.0.0.1:6379/2", cfg.RedisURL)
+				assert.Equal(t, "/tmp/evidence-custom", cfg.LocalStorageRoot)
 				assert.Equal(t, "debug", cfg.LogLevel)
 				assert.Equal(t, 30*time.Minute, cfg.JWTTTL)
 				assert.Equal(t, "9090", cfg.Port)
@@ -121,6 +127,28 @@ func TestLoadFromLookup(t *testing.T) {
 			name: "localhost hostname DATABASE_URL refused (strict 127.0.0.1 guard)",
 			env: map[string]string{
 				"DATABASE_URL": "postgres://postgres@localhost:5432/truecrime_dev",
+				"JWT_SECRET":   validSecret,
+				"LISTEN_ADDR":  "127.0.0.1:8080",
+			},
+			wantErr:     true,
+			errContains: "must be 127.0.0.1",
+		},
+		{
+			name: "non-loopback remote REDIS_URL refused",
+			env: map[string]string{
+				"DATABASE_URL": validDBURL,
+				"REDIS_URL":    "redis://redis.prod.internal:6379/0",
+				"JWT_SECRET":   validSecret,
+				"LISTEN_ADDR":  "127.0.0.1:8080",
+			},
+			wantErr:     true,
+			errContains: "REDIS_URL host",
+		},
+		{
+			name: "localhost hostname REDIS_URL refused (strict 127.0.0.1 guard)",
+			env: map[string]string{
+				"DATABASE_URL": validDBURL,
+				"REDIS_URL":    "redis://localhost:6379/0",
 				"JWT_SECRET":   validSecret,
 				"LISTEN_ADDR":  "127.0.0.1:8080",
 			},

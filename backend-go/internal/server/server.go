@@ -15,7 +15,9 @@ import (
 	"github.com/mahitss/evidence_architecture/backend-go/internal/auth"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/config"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/handlers"
+	"github.com/mahitss/evidence_architecture/backend-go/internal/queue"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/server/middleware"
+	"github.com/mahitss/evidence_architecture/backend-go/internal/storage"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/store"
 	"github.com/rs/zerolog"
 )
@@ -29,11 +31,34 @@ type Server struct {
 	authHandler *handlers.AuthHandler
 }
 
-// New constructs a Server with chi routing and middleware ordered as:
-// requestid -> logging -> recoverer -> errorenvelope -> router (JWT strictly on protected /api/v1/admin/*).
+// New constructs a Server using LocalStorage (from cfg.LocalStorageRoot) and a nil queue
+// publisher if none is supplied explicitly. Use NewWithDeps when wiring Redis Streams publishing.
 func New(cfg config.Config, st *store.Store) (*Server, error) {
+	ls, err := storage.NewLocalStorage(cfg.LocalStorageRoot)
+	if err != nil {
+		return nil, fmt.Errorf("init local storage: %w", err)
+	}
+	return NewWithDeps(cfg, st, ls, nil)
+}
+
+// NewWithDeps constructs a Server with explicit Storage and EvidencePublisher dependencies.
+// Middleware order: requestid -> logging -> recoverer -> errorenvelope -> router
+// (JWT strictly on protected /api/v1/admin/* endpoints).
+func NewWithDeps(
+	cfg config.Config,
+	st *store.Store,
+	objStorage storage.Storage,
+	publisher queue.EvidencePublisher,
+) (*Server, error) {
 	if st == nil {
 		return nil, errors.New("store must not be nil")
+	}
+	if objStorage == nil {
+		ls, err := storage.NewLocalStorage(cfg.LocalStorageRoot)
+		if err != nil {
+			return nil, fmt.Errorf("init default local storage: %w", err)
+		}
+		objStorage = ls
 	}
 
 	level, err := zerolog.ParseLevel(cfg.LogLevel)
@@ -55,7 +80,10 @@ func New(cfg config.Config, st *store.Store) (*Server, error) {
 		cfg.LoginRateLimitPerMin,
 		logger,
 	)
-	adminCasesHandler := handlers.NewAdminCasesHandler(st.Cases, st.LegalReviews)
+	adminCasesHandler := handlers.NewAdminCasesHandler(st.Cases, st.LegalReviews, st.Evidence, objStorage)
+	adminCaseWriteHandler := handlers.NewAdminCaseWriteHandler(st.Cases)
+	adminEvidenceWriteHandler := handlers.NewAdminEvidenceWriteHandler(st.Evidence, objStorage, publisher, logger)
+	adminPublishHandler := handlers.NewAdminPublishHandler(st.LegalReviews, st.Cases)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -78,10 +106,23 @@ func New(cfg config.Config, st *store.Store) (*Server, error) {
 		// Unauthenticated login endpoint with in-memory IP rate limit
 		ar.Post("/login", authHandler.Login)
 
-		// JWT-protected admin routes
+		// JWT-protected admin read & write routes
 		ar.Group(func(protected chi.Router) {
 			protected.Use(middleware.RequireAdminJWT(jwtManager))
+
+			// Cases
+			protected.Post("/cases", adminCaseWriteHandler.Create)
 			protected.Get("/cases/{id}", adminCasesHandler.GetByID)
+			protected.Put("/cases/{id}", adminCaseWriteHandler.Update)
+			protected.Post("/cases/{id}/retract", adminCaseWriteHandler.Retract)
+
+			// Evidence
+			protected.Post("/cases/{id}/evidence", adminEvidenceWriteHandler.Upload)
+			protected.Put("/evidence/{id}", adminEvidenceWriteHandler.UpdateMetadata)
+
+			// Legal review & publish gate
+			protected.Post("/cases/{id}/legal-review", adminPublishHandler.RecordLegalReview)
+			protected.Post("/cases/{id}/publish", adminPublishHandler.Publish)
 		})
 	})
 

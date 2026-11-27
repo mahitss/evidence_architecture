@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/mahitss/evidence_architecture/backend-go/internal/auth"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/models"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/server/middleware"
+	"github.com/mahitss/evidence_architecture/backend-go/internal/storage"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/store"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,11 +44,20 @@ func (m mockLegalReviewReader) GetByID(_ context.Context, id uuid.UUID) (*models
 	return lr, nil
 }
 
+type mockEvidenceLister struct {
+	items map[uuid.UUID][]*models.EvidenceItem
+}
+
+func (m mockEvidenceLister) ListByCaseID(_ context.Context, caseID uuid.UUID) ([]*models.EvidenceItem, error) {
+	return m.items[caseID], nil
+}
+
 func TestAdminCasesHandler_GetByID(t *testing.T) {
 	t.Parallel()
 
 	caseID := uuid.MustParse("10000000-0000-0000-0000-000000000001")
 	reviewID := uuid.MustParse("20000000-0000-0000-0000-000000000001")
+	evidenceID := uuid.MustParse("40000000-0000-0000-0000-000000000001")
 	adminID := uuid.MustParse("00000000-0000-0000-0000-000000000001")
 	now := time.Now().UTC().Truncate(time.Second)
 
@@ -85,12 +96,36 @@ func TestAdminCasesHandler_GetByID(t *testing.T) {
 		},
 	}
 
+	evidenceLister := mockEvidenceLister{
+		items: map[uuid.UUID][]*models.EvidenceItem{
+			caseID: {
+				{
+					ID:               evidenceID,
+					CaseID:           caseID,
+					Title:            "Federal Indictment",
+					SourceType:       "gov_primary_record",
+					VerificationTier: 1,
+					LicenseStatus:    "PUBLIC_DOMAIN",
+					MimeType:         "application/pdf",
+					ByteSize:         1024,
+					SHA256Hash:       strings.Repeat("a", 64),
+					ObjectKey:        "cases/" + caseID.String() + "/evidence/" + evidenceID.String() + "/indictment.pdf",
+					ProcessingStatus: "COMPLETED",
+					RetrievedAt:      now,
+				},
+			},
+		},
+	}
+
+	localStore, err := storage.NewLocalStorage(t.TempDir())
+	require.NoError(t, err)
+
 	jwtMgr, err := auth.NewJWTManager("admin-cases-test-jwt-secret-minimum-32-chars")
 	require.NoError(t, err)
 	validToken, err := jwtMgr.Issue(adminID.String(), time.Hour)
 	require.NoError(t, err)
 
-	h := NewAdminCasesHandler(caseStore, reviewStore)
+	h := NewAdminCasesHandler(caseStore, reviewStore, evidenceLister, localStore)
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Group(func(protected chi.Router) {
@@ -98,7 +133,7 @@ func TestAdminCasesHandler_GetByID(t *testing.T) {
 		protected.Get("/api/v1/admin/cases/{id}", h.GetByID)
 	})
 
-	t.Run("200 with valid JWT returns case and expanded legal review summary", func(t *testing.T) {
+	t.Run("200 with valid JWT returns case, review summary, and evidence items with signed URL", func(t *testing.T) {
 		t.Parallel()
 		req := httptest.NewRequest(http.MethodGet, "/api/v1/admin/cases/"+caseID.String(), nil)
 		req.Header.Set("Authorization", "Bearer "+validToken)
@@ -116,6 +151,10 @@ func TestAdminCasesHandler_GetByID(t *testing.T) {
 		assert.Equal(t, "APPROVED", resp.PublishedLegalReview.Decision)
 		assert.Equal(t, "DEV-SEED", resp.PublishedLegalReview.ExternalCounselRef)
 		assert.True(t, resp.PublishedLegalReview.ProhibitedChecklistPassed)
+		require.Len(t, resp.EvidenceItems, 1)
+		assert.Equal(t, evidenceID, resp.EvidenceItems[0].ID)
+		assert.True(t, strings.HasPrefix(resp.EvidenceItems[0].SignedURL, "file://"))
+		assert.Contains(t, resp.EvidenceItems[0].SignedURL, "sig=")
 	})
 
 	t.Run("401 without JWT token", func(t *testing.T) {
