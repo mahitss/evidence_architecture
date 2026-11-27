@@ -109,3 +109,46 @@ make services-down
 1. **`./data/` ownership:** When running as a non-root user, that user must have write permission to `./data/` (e.g., own the workspace checkout as in CI, or own `./data/`). If `./data/` was previously initialized as another user (e.g., `appuser`), remove or `chown` `./data/` before running `make services-up`.
 2. **Sandbox verification status (`UNVERIFIED-IN-SANDBOX`):** In Prompt 5, testing with temporary user `ci_sim` (`uid=1001`) confirmed `run_as()` Branch 2 executes without invoking `su` or `chown` and that guards/status/stop shell logic run cleanly. However, live PostgreSQL/Redis startup as `ci_sim` could not complete because container idle recycle wiped `/usr/lib/postgresql/15/bin/*` and `redis-server` from the ephemeral root filesystem while `apt-get` was prohibited. Full live non-root service verification is tracked as **MUST VERIFY ON FIRST CI RUN** in `docs/23-decisions/ADR-003-local-dev-direct-processes.md`.
 3. **Ephemeral root filesystem on container recycle:** On this sandbox host, files under `/app/applet` persist across idle restarts, whereas `.git/` and OS-level installs outside `/app/applet` (`/usr/local/go`, `/root/.cargo`, PostgreSQL, Redis, `/root/.gitconfig`) do not. Always push commits to a remote origin once configured and re-bootstrap toolchains after container recycles.
+
+---
+
+## 7. Database migrations
+
+Database schema migrations are managed with **`golang-migrate` CLI (`v4`)** compiled with the PostgreSQL driver tag via `go install` (never `apt-get`; see `docs/23-decisions/ADR-016-migration-tooling.md`).
+
+### Install `golang-migrate` (one-time per fresh sandbox)
+
+```bash
+bash scripts/install-migrate.sh
+# Equivalent direct command:
+# go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+```
+
+Ensure `$HOME/go/bin` is on your `PATH` (handled automatically by `scripts/migrate.sh`):
+
+```bash
+export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.cargo/bin:$PATH"
+```
+
+### Run Migrations Locally
+
+Start PostgreSQL first (`make services-up`), then use `scripts/migrate.sh` (defaults to `postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable` and refuses any non-`127.0.0.1` host):
+
+```bash
+bash scripts/migrate.sh up          # Apply all pending migrations
+bash scripts/migrate.sh up 1        # Apply next 1 migration step
+bash scripts/migrate.sh status      # Print current migration version
+bash scripts/migrate.sh down 1      # Roll back 1 migration (default: 1)
+bash scripts/migrate.sh down 2      # Roll back 2 migrations
+bash scripts/migrate.sh force <V>   # Force version V to recover dirty state
+bash scripts/migrate.sh reset       # Roll back all then re-apply all (prompts for 'yes')
+```
+
+### Verify All Schema Constraints & Triggers (`T1`–`T16`)
+
+Run the end-to-end migration and database invariant test suite (starts local services, verifies all 8 tables, tests Q5 `CHECK` constraint, `NOT NULL`, `chk_no_recreated_tier3_tier4`, bidirectional legal-review publish trigger, append-only `audit_log`, immutable `legal_review_records`, full rollback + re-apply, and stops local services):
+
+```bash
+bash scripts/test-migrations.sh
+```
+

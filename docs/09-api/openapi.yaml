@@ -1,0 +1,1353 @@
+openapi: 3.1.0
+info:
+  title: True Crime Investigation Platform API
+  version: 1.0.0
+  summary: v1.0 Anonymous Reader and Internal Admin API
+  description: |
+    Authoritative OpenAPI 3.1 contract for the True Crime Investigation Platform (MVP / v1.0).
+
+    Architectural guarantees:
+    - Reader surface is strictly anonymous (no user accounts or login at launch; ADR-007).
+    - Reader endpoints are IP-geoblocked for EU/EEA regions at edge/middleware returning HTTP 451 (ADR-008, ADR-015).
+    - Unpublished/draft/retracted cases are never exposed on public endpoints (uniform HTTP 404).
+    - Admin endpoints require a short-lived Bearer JWT issued via POST /api/v1/admin/login.
+    - Evidence ingestion enforces the 4x3 Verification Tier x License Status matrix and PO Decision Q5.
+    - Error envelope on all 4xx/5xx responses: `{ "error": { "code": "...", "message": "...", "request_id": "..." } }`.
+    - Cursor pagination on collection responses: `{ "data": [...], "next_cursor": "...", "has_more": bool }`.
+  license:
+    name: Proprietary — Internal Architecture Contract
+    url: https://github.com/mahitss/evidence_architecture
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: Local development sandbox (no Docker; ADR-003)
+  - url: https://api.example.invalid
+    description: Future production API origin (provider deferred; ADR-013)
+
+tags:
+  - name: Reader
+    description: Anonymous public read and correction submission endpoints (EU/EEA geoblocked)
+  - name: Admin
+    description: Internal JWT-protected authoring, evidence ingestion, legal review, and publish/retract endpoints
+
+paths:
+  /api/v1/cases:
+    get:
+      tags: [Reader]
+      operationId: listPublishedCases
+      summary: List published cases (cursor-paginated)
+      description: |
+        Returns cursor-paginated published case summaries filterable by launch category.
+        **Auth:** None (anonymous; EU/EEA geoblocked at edge/middleware -> HTTP 451).
+        **Rate Limit:** 120 requests/minute per IP.
+        **Idempotency:** Safe, idempotent GET.
+        **Security Note:** Public callers can only retrieve `PUBLISHED` cases; passing any non-`PUBLISHED` `status` query value returns HTTP 400 or empty set (never leaks drafts).
+      x-rate-limit: 120 req/min per IP
+      security: []
+      parameters:
+        - name: category
+          in: query
+          required: false
+          description: Filter by launch case category.
+          schema:
+            $ref: '#/components/schemas/CaseCategory'
+        - name: status
+          in: query
+          required: false
+          description: Must be `PUBLISHED` for anonymous reader requests (defaults to `PUBLISHED`; non-`PUBLISHED` values are rejected with HTTP 400).
+          schema:
+            type: string
+            enum: [PUBLISHED]
+            default: PUBLISHED
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Paginated list of published cases.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '429':
+          $ref: '#/components/responses/RateLimitedError'
+        '451':
+          $ref: '#/components/responses/GeoblockedError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/cases/{slug}:
+    get:
+      tags: [Reader]
+      operationId: getPublishedCaseBySlug
+      summary: Get published case dossier detail with evidence list and timeline
+      description: |
+        Returns the full published case dossier including Official Briefing, mandatory Genuine Gaps, ordered timeline events, evidence item summaries, and public corrections log.
+        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
+        **Rate Limit:** 120 requests/minute per IP.
+        **Idempotency:** Safe, idempotent GET.
+        **Security Note (T1):** Draft, in-review, approved, retracted, or non-existent slugs MUST return an identical HTTP 404 response.
+      x-rate-limit: 120 req/min per IP
+      security: []
+      parameters:
+        - name: slug
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'
+            minLength: 3
+            maxLength: 120
+      responses:
+        '200':
+          description: Published case dossier.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaseDetail'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitedError'
+        '451':
+          $ref: '#/components/responses/GeoblockedError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/evidence/{id}:
+    get:
+      tags: [Reader]
+      operationId: getPublishedEvidenceById
+      summary: Get published evidence metadata and short-lived signed file URL
+      description: |
+        Returns evidence metadata, Verification Tier and License Status display rules, SHA-256 hash, source citation, and a short-lived (<= 300s) pre-signed S3-compatible GET URL.
+        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
+        **Rate Limit:** 60 requests/minute per IP.
+        **Idempotency:** Safe, idempotent GET (mints fresh pre-signed URL per call).
+        **Security Note:** Returns HTTP 404 if parent case is not `PUBLISHED`; returns redacted tombstone metadata with `signed_file_url: null` if item was redacted via kill-switch.
+      x-rate-limit: 60 req/min per IP
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EvidenceIdParam'
+      responses:
+        '200':
+          description: Published evidence item metadata and signed file URL.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceDetail'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '429':
+          $ref: '#/components/responses/RateLimitedError'
+        '451':
+          $ref: '#/components/responses/GeoblockedError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/search:
+    get:
+      tags: [Reader]
+      operationId: searchPublishedContent
+      summary: Full-text search across published cases, extracted evidence text, and OCR output
+      description: |
+        Queries self-hosted Meilisearch (ADR-012) across published case titles, summaries, extracted PDF text, and OCR text.
+        Server unconditionally injects `case_status = "PUBLISHED"` filter; user-supplied filter strings are never interpolated raw into Meilisearch filter expressions (T5).
+        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
+        **Rate Limit:** 30 requests/minute per IP.
+        **Idempotency:** Safe, idempotent GET.
+      x-rate-limit: 30 req/min per IP
+      security: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query string (plain text; max 200 characters).
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 200
+        - name: category
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/CaseCategory'
+        - name: verification_tier
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/VerificationTier'
+        - name: license_status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/LicenseStatus'
+        - $ref: '#/components/parameters/CursorParam'
+        - $ref: '#/components/parameters/LimitParam'
+      responses:
+        '200':
+          description: Cursor-paginated search hits with highlighted snippets.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '429':
+          $ref: '#/components/responses/RateLimitedError'
+        '451':
+          $ref: '#/components/responses/GeoblockedError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/corrections:
+    post:
+      tags: [Reader]
+      operationId: submitCorrectionRequest
+      summary: Submit a public correction, defamation/copyright takedown, or privacy grievance
+      description: |
+        Persists a correction/takedown request in PostgreSQL and returns a unique tracking `ticket_id` (no outbound email at MVP; reviewed in Admin Web).
+        Includes a hidden honeypot field (`website`); non-empty honeypot submissions are silently rejected/dropped without persisting spam (T4).
+        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
+        **Rate Limit:** 5 requests/hour per IP (HTTP 429 with `Retry-After`).
+        **Idempotency:** Requires `Idempotency-Key` header (UUIDv4/v7; 24-hour Redis deduplication window).
+      x-rate-limit: 5 req/hour per IP
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CorrectionCreateRequest'
+      responses:
+        '201':
+          description: Correction request accepted and persisted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CorrectionCreateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+        '429':
+          $ref: '#/components/responses/RateLimitedError'
+        '451':
+          $ref: '#/components/responses/GeoblockedError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/admin/login:
+    post:
+      tags: [Admin]
+      operationId: adminLogin
+      summary: Authenticate internal Admin user and issue short-lived Bearer JWT
+      description: |
+        Verifies credentials against `admin_users` (Argon2id hash) and issues a 60-minute signed JWT.
+        **Auth:** Public admin login endpoint (credentials required; single admin user at MVP).
+        **Rate Limit:** 5 attempts per 15 minutes per IP + exponential backoff lockout (T2).
+        **Idempotency:** Non-idempotent (issues a fresh JWT `jti` on each successful login).
+      x-rate-limit: 5 req/15min per IP
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminLoginRequest'
+      responses:
+        '200':
+          description: Authentication succeeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminLoginResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '429':
+          $ref: '#/components/responses/RateLimitedError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/admin/cases:
+    post:
+      tags: [Admin]
+      operationId: adminCreateCase
+      summary: Create a new draft case
+      description: |
+        Creates a new case initialized strictly in `DRAFT` status (invisible on public routes).
+        **Auth:** Bearer JWT (`ADMIN` role).
+        **Rate Limit:** 30 requests/minute per admin token.
+        **Idempotency:** Unique `slug` constraint prevents duplicate creation (`HTTP 409`).
+      x-rate-limit: 30 req/min per admin
+      security:
+        - AdminBearerJWT: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminCaseWriteRequest'
+      responses:
+        '201':
+          description: Draft case created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+
+  /api/v1/admin/cases/{id}:
+    put:
+      tags: [Admin]
+      operationId: adminUpdateCase
+      summary: Update case metadata, Official Briefing, Genuine Gaps, or timeline
+      description: |
+        Updates an existing case. If the case is currently `PUBLISHED`, substantive updates require re-review or explicit correction logging; cannot bypass `legal_review_records` to set `status = PUBLISHED`.
+        **Auth:** Bearer JWT (`ADMIN` role).
+        **Rate Limit:** 60 requests/minute per admin token.
+        **Idempotency:** Idempotent PUT (full resource replacement of mutable fields).
+      x-rate-limit: 60 req/min per admin
+      security:
+        - AdminBearerJWT: []
+      parameters:
+        - $ref: '#/components/parameters/CaseIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminCaseWriteRequest'
+      responses:
+        '200':
+          description: Case updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+
+  # MANDATORY Q5 DATABASE & API CHECK CONSTRAINT (PO Decision Q5 / EVIDENCE_INTEGRITY_SPEC.md §2):
+  # NOT (source_type = 'third_party_exhibit' AND license_status = 'PUBLIC_DOMAIN')
+  # Any evidence upload violating this rule MUST be rejected with HTTP 422 (EVIDENCE_POLICY_BLOCKED)
+  # AND is independently enforced at the PostgreSQL layer via CHECK constraint on evidence_items.
+  /api/v1/admin/cases/{id}/evidence:
+    post:
+      tags: [Admin]
+      operationId: adminUploadEvidence
+      summary: Upload evidence file and metadata (triggers async Rust extraction)
+      description: |
+        Accepts `multipart/form-data` containing the binary file (<= 25 MB: PDF, PNG, JPEG, or plain text) and structured metadata JSON.
+        Enforces the 4x3 Verification Tier x License Status matrix and PO Decision Q5 (`NOT (source_type = 'third_party_exhibit' AND license_status = 'PUBLIC_DOMAIN')`) before uploading to S3, writing `evidence_items` (`processing_status = PENDING`), and publishing a job to Redis Streams (`evidence:jobs`).
+        **Auth:** Bearer JWT (`ADMIN` role).
+        **Rate Limit:** 20 uploads/minute per admin token (max 4 concurrent uploads via server semaphore).
+        **Idempotency:** Requires `Idempotency-Key` header (24-hour Redis deduplication window preventing duplicate S3 objects and Redis jobs).
+      x-rate-limit: 20 req/min per admin
+      security:
+        - AdminBearerJWT: []
+      parameters:
+        - $ref: '#/components/parameters/CaseIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AdminEvidenceUploadRequest'
+      responses:
+        '201':
+          description: Evidence persisted and extraction job enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminEvidenceResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '413':
+          $ref: '#/components/responses/PayloadTooLargeError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/admin/evidence/{id}:
+    put:
+      tags: [Admin]
+      operationId: adminUpdateEvidenceMetadata
+      summary: Update evidence metadata (triggers re-review if parent case is PUBLISHED)
+      description: |
+        Updates mutable metadata fields on an evidence item (enforcing Q5 and 4x3 Display Rules Matrix).
+        **Security & Integrity Rule (T6):** If the parent case is currently `PUBLISHED`, any change to `verification_tier`, `license_status`, `source_type`, `source_citation`, or `prohibited_content_cleared` atomically transitions the parent case back to `IN_REVIEW`, removes it from the public Meilisearch index, and writes an `EVIDENCE_UPDATED_REREVIEW` entry to `audit_log` so unreviewed edits cannot silently appear live.
+        **Auth:** Bearer JWT (`ADMIN` role).
+        **Rate Limit:** 30 requests/minute per admin token.
+        **Idempotency:** Idempotent PUT.
+      x-rate-limit: 30 req/min per admin
+      security:
+        - AdminBearerJWT: []
+      parameters:
+        - $ref: '#/components/parameters/EvidenceIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminEvidenceUpdateRequest'
+      responses:
+        '200':
+          description: Evidence metadata updated (with `re_review_triggered` flag indicating if parent case returned to `IN_REVIEW`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminEvidenceUpdateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+
+  /api/v1/admin/cases/{id}/legal-review:
+    post:
+      tags: [Admin]
+      operationId: adminRecordLegalReview
+      summary: Record external legal counsel sign-off for a case
+      description: |
+        Inserts an immutable `legal_review_records` row documenting external legal counsel review (`external_counsel_ref`, `decision`, checklists, `reviewed_at`). If `decision = APPROVED`, transitions case to `APPROVED` (ready for `POST /publish`).
+        **Auth:** Bearer JWT (`ADMIN` role).
+        **Rate Limit:** 20 requests/minute per admin token.
+        **Idempotency:** Non-idempotent append of immutable review history.
+      x-rate-limit: 20 req/min per admin
+      security:
+        - AdminBearerJWT: []
+      parameters:
+        - $ref: '#/components/parameters/CaseIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LegalReviewCreateRequest'
+      responses:
+        '201':
+          description: Immutable legal review record created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LegalReviewResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+
+  /api/v1/admin/cases/{id}/publish:
+    post:
+      tags: [Admin]
+      operationId: adminPublishCase
+      summary: Publish an approved case (hard legal-review gate enforced)
+      description: |
+        Transitions a case to `PUBLISHED` and indexes it + completed evidence items in Meilisearch.
+        **Hard Gate:** Fails with HTTP 422 unless an `APPROVED` `legal_review_records` row exists for the case, `genuine_gaps` has >= 1 entry, zero evidence items are `PENDING`/`FAILED` or `prohibited_content_cleared = false`, and EU/GDPR gate passes.
+        **Auth:** Bearer JWT (`ADMIN` role).
+        **Rate Limit:** 10 requests/minute per admin token.
+        **Idempotency:** Requires `Idempotency-Key` header (retrying with same key returns original 200 publish response without duplicate audit entries).
+      x-rate-limit: 10 req/min per admin
+      security:
+        - AdminBearerJWT: []
+      parameters:
+        - $ref: '#/components/parameters/CaseIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishCaseRequest'
+      responses:
+        '200':
+          description: Case published and queued/synced to Meilisearch.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCaseResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailableError'
+
+  /api/v1/admin/cases/{id}/retract:
+    post:
+      tags: [Admin]
+      operationId: adminRetractCase
+      summary: Emergency kill-switch to immediately retract a published case
+      description: |
+        Immediately transitions case status to `RETRACTED` in PostgreSQL, appends an immutable `audit_log` entry with mandatory `reason_code`, and removes case + evidence documents from Meilisearch (effective <= 60s; REQ-031).
+        **Auth:** Bearer JWT (`ADMIN` role).
+        **Rate Limit:** 20 requests/minute per admin token.
+        **Idempotency:** Safe to repeat on an already-retracted case (returns HTTP 200 with current retracted state).
+      x-rate-limit: 20 req/min per admin
+      security:
+        - AdminBearerJWT: []
+      parameters:
+        - $ref: '#/components/parameters/CaseIdParam'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RetractCaseRequest'
+      responses:
+        '200':
+          description: Case retracted from public endpoints and search index.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminCaseResponse'
+        '401':
+          $ref: '#/components/responses/UnauthorizedError'
+        '403':
+          $ref: '#/components/responses/ForbiddenError'
+        '404':
+          $ref: '#/components/responses/NotFoundError'
+        '422':
+          $ref: '#/components/responses/UnprocessableError'
+
+components:
+  securitySchemes:
+    AdminBearerJWT:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Short-lived (60m) signed HS256/EdDSA JWT issued by POST /api/v1/admin/login and checked against Redis revocation denylist.
+
+  parameters:
+    CaseIdParam:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    EvidenceIdParam:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CursorParam:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque base64url cursor returned by previous page's `next_cursor`.
+      schema:
+        type: string
+        maxLength: 256
+    LimitParam:
+      name: limit
+      in: query
+      required: false
+      description: Page size (default 20, max 50).
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 50
+        default: 20
+    IdempotencyKeyHeader:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUIDv4/v7 ensuring at-most-once execution across network retries (24-hour TTL in Redis).
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    BadRequestError:
+      description: Malformed request parameters or JSON syntax.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnauthorizedError:
+      description: Missing, expired, invalid, or revoked Admin Bearer JWT.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ForbiddenError:
+      description: Authenticated role lacks permission for this operation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    NotFoundError:
+      description: Resource not found (also returned uniformly for unpublished/draft cases on reader endpoints).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ConflictError:
+      description: Uniqueness or state conflict (e.g., duplicate case slug).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    PayloadTooLargeError:
+      description: Uploaded evidence file exceeds 25 MB limit.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    UnprocessableError:
+      description: Domain, Evidence Integrity (4x3 matrix / Q5 CHECK), or legal publication gate validation failure.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    RateLimitedError:
+      description: Rate limit exceeded; inspect `Retry-After` header.
+      headers:
+        Retry-After:
+          description: Seconds until caller may retry.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    GeoblockedError:
+      description: Request originated from a geoblocked EU/EEA region (ADR-008).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+    ServiceUnavailableError:
+      description: Upstream dependency (PostgreSQL, Redis, Meilisearch, or S3 storage) temporarily unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorEnvelope'
+
+  schemas:
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code:
+              type: string
+              examples: [EVIDENCE_POLICY_BLOCKED, LEGAL_REVIEW_REQUIRED, NOT_FOUND, RATE_LIMITED, REGION_UNAVAILABLE]
+            message:
+              type: string
+            request_id:
+              type: string
+              format: uuid
+
+    CaseCategory:
+      type: string
+      enum: [financial_crime, historical_public_record]
+
+    CaseStatus:
+      type: string
+      enum: [DRAFT, IN_REVIEW, APPROVED, PUBLISHED, RETRACTED]
+
+    VerificationTier:
+      type: integer
+      enum: [1, 2, 3, 4]
+
+    LicenseStatus:
+      type: string
+      enum: [PUBLIC_DOMAIN, LICENSED, RECREATED]
+
+    SourceType:
+      type: string
+      enum:
+        - gov_primary_record
+        - court_opinion_or_order
+        - third_party_exhibit
+        - historical_public_domain
+        - licensed_media
+        - in_house_recreation
+
+    GenuineGap:
+      type: object
+      required: [claim, why_unverified, highest_available_tier]
+      properties:
+        claim:
+          type: string
+          minLength: 5
+        why_unverified:
+          type: string
+          minLength: 5
+        highest_available_tier:
+          type: string
+          enum: [None, Tier 2, Tier 3, Tier 4]
+        citation_url:
+          type: [string, 'null']
+          format: uri
+
+    ConflictingSource:
+      type: object
+      required: [source_name, verification_tier, source_date, excerpt]
+      properties:
+        source_name:
+          type: string
+        verification_tier:
+          $ref: '#/components/schemas/VerificationTier'
+        source_date:
+          type: string
+          format: date
+        excerpt:
+          type: string
+        evidence_id:
+          type: [string, 'null']
+          format: uuid
+
+    TimelineEvent:
+      type: object
+      required:
+        - id
+        - event_start_date
+        - sort_order
+        - event_type
+        - title
+        - summary
+        - verification_tier
+        - linked_evidence_ids
+        - has_conflict
+        - conflicting_sources
+      properties:
+        id:
+          type: string
+          format: uuid
+        event_start_date:
+          type: string
+          format: date
+        event_end_date:
+          type: [string, 'null']
+          format: date
+        sort_order:
+          type: integer
+        event_type:
+          type: string
+          enum: [filing, transaction, arrest, hearing, verdict, release, other]
+        title:
+          type: string
+        summary:
+          type: string
+        verification_tier:
+          $ref: '#/components/schemas/VerificationTier'
+        linked_evidence_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        has_conflict:
+          type: boolean
+        conflicting_sources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConflictingSource'
+        controlling_status_note:
+          type: [string, 'null']
+
+    EvidenceSummary:
+      type: object
+      required:
+        - id
+        - title
+        - source_type
+        - verification_tier
+        - license_status
+        - source_citation
+        - sha256_hash
+        - is_redacted
+        - warning_level
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        source_type:
+          $ref: '#/components/schemas/SourceType'
+        verification_tier:
+          $ref: '#/components/schemas/VerificationTier'
+        license_status:
+          $ref: '#/components/schemas/LicenseStatus'
+        source_citation:
+          type: string
+        sha256_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        is_redacted:
+          type: boolean
+        warning_level:
+          type: string
+          enum: [NONE, WARNING, DOUBLE_WARNING, HIGH_WARNING]
+
+    EvidenceDetail:
+      allOf:
+        - $ref: '#/components/schemas/EvidenceSummary'
+        - type: object
+          required:
+            - case_id
+            - issuing_authority
+            - license_basis_note
+            - mime_type
+            - byte_size
+            - retrieved_at
+            - signed_file_url
+            - signed_url_expires_at
+          properties:
+            case_id:
+              type: string
+              format: uuid
+            issuing_authority:
+              type: string
+            source_url:
+              type: [string, 'null']
+              format: uri
+            license_basis_note:
+              type: string
+            credit_line:
+              type: [string, 'null']
+            recreation_author_note:
+              type: [string, 'null']
+            mime_type:
+              type: string
+              enum: [application/pdf, image/png, image/jpeg, text/plain]
+            byte_size:
+              type: integer
+            page_count:
+              type: [integer, 'null']
+            ocr_used:
+              type: boolean
+            retrieved_at:
+              type: string
+              format: date-time
+            redaction_reason:
+              type: [string, 'null']
+            signed_file_url:
+              type: [string, 'null']
+              format: uri
+              description: Short-lived (<= 300s) pre-signed S3 GET URL; null if item is redacted.
+            signed_url_expires_at:
+              type: [string, 'null']
+              format: date-time
+
+    CaseSummary:
+      type: object
+      required: [id, slug, title, category, jurisdiction, evidence_count, published_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        title:
+          type: string
+        category:
+          $ref: '#/components/schemas/CaseCategory'
+        jurisdiction:
+          type: string
+        evidence_count:
+          type: integer
+          minimum: 0
+        published_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    CaseListResponse:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/CaseSummary'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+
+    CorrectionLogEntry:
+      type: object
+      required: [date, summary, affected_section]
+      properties:
+        date:
+          type: string
+          format: date-time
+        summary:
+          type: string
+        affected_section:
+          type: string
+
+    CaseDetail:
+      allOf:
+        - $ref: '#/components/schemas/CaseSummary'
+        - type: object
+          required:
+            - official_briefing
+            - genuine_gaps
+            - evidence_items
+            - timeline_events
+            - corrections_log
+          properties:
+            official_briefing:
+              type: string
+            genuine_gaps:
+              type: array
+              minItems: 1
+              items:
+                $ref: '#/components/schemas/GenuineGap'
+            evidence_items:
+              type: array
+              items:
+                $ref: '#/components/schemas/EvidenceSummary'
+            timeline_events:
+              type: array
+              items:
+                $ref: '#/components/schemas/TimelineEvent'
+            corrections_log:
+              type: array
+              items:
+                $ref: '#/components/schemas/CorrectionLogEntry'
+
+    SearchHit:
+      type: object
+      required: [hit_type, case_id, case_slug, case_title, category, snippet]
+      properties:
+        hit_type:
+          type: string
+          enum: [case, evidence]
+        case_id:
+          type: string
+          format: uuid
+        case_slug:
+          type: string
+        case_title:
+          type: string
+        category:
+          $ref: '#/components/schemas/CaseCategory'
+        evidence_id:
+          type: [string, 'null']
+          format: uuid
+        evidence_title:
+          type: [string, 'null']
+        verification_tier:
+          type: [integer, 'null']
+          enum: [1, 2, 3, 4, null]
+        license_status:
+          type: [string, 'null']
+          enum: [PUBLIC_DOMAIN, LICENSED, RECREATED, null]
+        snippet:
+          type: string
+
+    SearchResponse:
+      type: object
+      required: [data, next_cursor, has_more]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchHit'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+
+    CorrectionCreateRequest:
+      type: object
+      required: [request_type, requester_contact_email, description]
+      properties:
+        case_slug:
+          type: [string, 'null']
+        evidence_id:
+          type: [string, 'null']
+          format: uuid
+        request_type:
+          type: string
+          enum: [factual_correction, defamation_takedown, copyright_takedown, privacy_grievance]
+        requester_contact_email:
+          type: string
+          format: email
+        description:
+          type: string
+          minLength: 10
+          maxLength: 5000
+        supporting_citation:
+          type: [string, 'null']
+          maxLength: 1000
+        website:
+          type: string
+          maxLength: 200
+          description: Hidden anti-spam honeypot field; legitimate clients leave empty.
+
+    CorrectionCreateResponse:
+      type: object
+      required: [ticket_id, status, created_at]
+      properties:
+        ticket_id:
+          type: string
+        status:
+          type: string
+          enum: [OPEN]
+        created_at:
+          type: string
+          format: date-time
+
+    AdminLoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          minLength: 12
+          maxLength: 128
+
+    AdminLoginResponse:
+      type: object
+      required: [access_token, token_type, expires_at]
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_at:
+          type: string
+          format: date-time
+
+    AdminCaseWriteRequest:
+      type: object
+      required: [slug, title, category, jurisdiction, eu_origin, official_briefing, genuine_gaps]
+      properties:
+        slug:
+          type: string
+          pattern: '^[a-z0-9]+(?:-[a-z0-9]+)*$'
+        title:
+          type: string
+          minLength: 3
+          maxLength: 200
+        category:
+          $ref: '#/components/schemas/CaseCategory'
+        jurisdiction:
+          type: string
+        eu_origin:
+          type: boolean
+        gdpr_verified:
+          type: boolean
+          default: false
+        official_briefing:
+          type: string
+        genuine_gaps:
+          type: array
+          items:
+            $ref: '#/components/schemas/GenuineGap'
+
+    AdminCaseResponse:
+      type: object
+      required: [id, slug, title, category, jurisdiction, eu_origin, gdpr_verified, status, published_legal_review_id, search_sync_pending, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        slug:
+          type: string
+        title:
+          type: string
+        category:
+          $ref: '#/components/schemas/CaseCategory'
+        jurisdiction:
+          type: string
+        eu_origin:
+          type: boolean
+        gdpr_verified:
+          type: boolean
+        status:
+          $ref: '#/components/schemas/CaseStatus'
+        published_legal_review_id:
+          type: [string, 'null']
+          format: uuid
+        search_sync_pending:
+          type: boolean
+        published_at:
+          type: [string, 'null']
+          format: date-time
+        retracted_at:
+          type: [string, 'null']
+          format: date-time
+        retraction_reason:
+          type: [string, 'null']
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AdminEvidenceUploadRequest:
+      type: object
+      required:
+        - file
+        - title
+        - source_type
+        - verification_tier
+        - license_status
+        - source_citation
+        - issuing_authority
+        - license_basis_note
+        - retrieved_at
+      properties:
+        file:
+          type: string
+          contentMediaType: application/octet-stream
+          description: Binary PDF, PNG, JPEG, or plain text file (<= 25 MB).
+        title:
+          type: string
+          minLength: 3
+          maxLength: 250
+        source_type:
+          $ref: '#/components/schemas/SourceType'
+        verification_tier:
+          $ref: '#/components/schemas/VerificationTier'
+        license_status:
+          $ref: '#/components/schemas/LicenseStatus'
+        licensing_record_id:
+          type: [string, 'null']
+          format: uuid
+          description: Mandatory when `license_status = LICENSED`.
+        recreation_source_ids:
+          type: [array, 'null']
+          items:
+            type: string
+          description: Mandatory non-empty array when `license_status = RECREATED`.
+        recreation_author_note:
+          type: [string, 'null']
+        source_citation:
+          type: string
+          minLength: 3
+        source_url:
+          type: [string, 'null']
+          format: uri
+        issuing_authority:
+          type: string
+        license_basis_note:
+          type: string
+        prohibited_content_cleared:
+          type: boolean
+          default: false
+        retrieved_at:
+          type: string
+          format: date-time
+
+    AdminEvidenceResponse:
+      type: object
+      required: [id, case_id, title, source_type, verification_tier, license_status, sha256_hash, processing_status, job_id, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        case_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        source_type:
+          $ref: '#/components/schemas/SourceType'
+        verification_tier:
+          $ref: '#/components/schemas/VerificationTier'
+        license_status:
+          $ref: '#/components/schemas/LicenseStatus'
+        sha256_hash:
+          type: string
+          pattern: '^[a-f0-9]{64}$'
+        processing_status:
+          type: string
+          enum: [PENDING, COMPLETED, FAILED]
+        job_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+
+    AdminEvidenceUpdateRequest:
+      type: object
+      required: [title, source_type, verification_tier, license_status, source_citation, issuing_authority, license_basis_note, prohibited_content_cleared]
+      properties:
+        title:
+          type: string
+        source_type:
+          $ref: '#/components/schemas/SourceType'
+        verification_tier:
+          $ref: '#/components/schemas/VerificationTier'
+        license_status:
+          $ref: '#/components/schemas/LicenseStatus'
+        licensing_record_id:
+          type: [string, 'null']
+          format: uuid
+        recreation_source_ids:
+          type: [array, 'null']
+          items:
+            type: string
+        recreation_author_note:
+          type: [string, 'null']
+        source_citation:
+          type: string
+        source_url:
+          type: [string, 'null']
+          format: uri
+        issuing_authority:
+          type: string
+        license_basis_note:
+          type: string
+        prohibited_content_cleared:
+          type: boolean
+
+    AdminEvidenceUpdateResponse:
+      type: object
+      required: [id, case_id, case_status, re_review_triggered, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        case_id:
+          type: string
+          format: uuid
+        case_status:
+          $ref: '#/components/schemas/CaseStatus'
+        re_review_triggered:
+          type: boolean
+        updated_at:
+          type: string
+          format: date-time
+
+    LegalReviewCreateRequest:
+      type: object
+      required:
+        - external_counsel_ref
+        - decision
+        - prohibited_checklist_passed
+        - genuine_gaps_verified
+        - license_audit_passed
+        - reviewed_at
+      properties:
+        external_counsel_ref:
+          type: string
+          minLength: 3
+          maxLength: 200
+        decision:
+          type: string
+          enum: [APPROVED, CHANGES_REQUESTED, REJECTED]
+        prohibited_checklist_passed:
+          type: boolean
+        genuine_gaps_verified:
+          type: boolean
+        license_audit_passed:
+          type: boolean
+        notes:
+          type: string
+          maxLength: 4000
+        reviewed_at:
+          type: string
+          format: date-time
+
+    LegalReviewResponse:
+      type: object
+      required: [id, case_id, reviewer_id, external_counsel_ref, decision, reviewed_at, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        case_id:
+          type: string
+          format: uuid
+        reviewer_id:
+          type: string
+          format: uuid
+        external_counsel_ref:
+          type: string
+        decision:
+          type: string
+          enum: [APPROVED, CHANGES_REQUESTED, REJECTED]
+        reviewed_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+
+    PublishCaseRequest:
+      type: object
+      required: [legal_review_id]
+      properties:
+        legal_review_id:
+          type: string
+          format: uuid
+          description: ID of an `APPROVED` row in `legal_review_records` belonging to this case.
+
+    RetractCaseRequest:
+      type: object
+      required: [reason_code, reason_detail]
+      properties:
+        reason_code:
+          type: string
+          enum: [DEFAMATION_NOTICE, COPYRIGHT_TAKEDOWN, PRIVACY_PII_EXPOSURE, FACTUAL_ERROR, LEGAL_COUNSEL_INSTRUCTION]
+        reason_detail:
+          type: string
+          minLength: 5
+          maxLength: 2000
