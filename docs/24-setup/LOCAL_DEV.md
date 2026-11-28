@@ -233,9 +233,12 @@ TOKEN=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/admin/login \
 
 ### 9.2 Create a DRAFT case
 
+All admin write endpoints require an `Idempotency-Key` header (`16`–`64` characters matching `^[A-Za-z0-9_-]{16,64}$`; 24-hour Redis TTL replay cache).
+
 ```bash
 CASE_ID=$(curl -sS -X POST http://127.0.0.1:8080/api/v1/admin/cases \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: create-case-demo-2026-0001" \
   -H 'Content-Type: application/json' \
   -d '{
     "slug": "us-sec-demo-2026",
@@ -255,6 +258,7 @@ Editing an `APPROVED` or `PUBLISHED` case returns `409 Conflict` (`"Case must be
 ```bash
 curl -sS -X PUT "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: update-case-demo-2026-0001" \
   -H 'Content-Type: application/json' \
   -d '{"title": "United States v. Demo Financial Corp. (Amended)"}' | jq .
 ```
@@ -266,6 +270,7 @@ printf 'Federal court exhibit text\n' > /tmp/sample-exhibit.txt
 
 EVIDENCE_ID=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/evidence" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: upload-evidence-demo-2026-0001" \
   -F 'file=@/tmp/sample-exhibit.txt;type=text/plain' \
   -F 'title=DOJ Press Release Exhibit A' \
   -F 'source_type=gov_primary_record' \
@@ -280,18 +285,19 @@ EVIDENCE_ID=$(curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_I
 
 ### 9.5 Q5 rejection example (`400 Bad Request` — fails fast before DB)
 
-Uploading a `third_party_exhibit` marked as `PUBLIC_DOMAIN` violates the Q5 evidence integrity policy and is rejected immediately with HTTP `400` without writing to storage, PostgreSQL, or Redis:
+Uploading a `third_party_exhibit` marked as `PUBLIC_DOMAIN` violates the Q5 evidence integrity policy and is rejected immediately with HTTP `400` (`error.code = "Q5_VIOLATION"`) without writing to storage, PostgreSQL, or Redis:
 
 ```bash
 curl -i -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/evidence" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: upload-q5-reject-demo-0001" \
   -F 'file=@/tmp/sample-exhibit.txt;type=text/plain' \
   -F 'title=Illegal Public Domain Claim' \
   -F 'source_type=third_party_exhibit' \
   -F 'rights_status=PUBLIC_DOMAIN' \
   -F 'verification_tier=2' \
   -F 'provenance_citation=Unlicensed third-party media'
-# Expected HTTP 400: {"error":{"code":"BAD_REQUEST","message":"third_party_exhibit cannot have rights_status=PUBLIC_DOMAIN (Q5 policy)","request_id":"..."}}
+# Expected HTTP 400: {"error":{"code":"Q5_VIOLATION","message":"third_party_exhibit cannot have rights_status=PUBLIC_DOMAIN (Q5 policy)","request_id":"..."}}
 ```
 
 ### 9.6 Update evidence metadata
@@ -299,6 +305,7 @@ curl -i -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/evidence"
 ```bash
 curl -sS -X PUT "http://127.0.0.1:8080/api/v1/admin/evidence/$EVIDENCE_ID" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: update-evidence-demo-0001" \
   -H 'Content-Type: application/json' \
   -d '{"prohibited_content_cleared": true}' | jq .
 ```
@@ -310,24 +317,26 @@ curl -sS -X PUT "http://127.0.0.1:8080/api/v1/admin/evidence/$EVIDENCE_ID" \
 ```bash
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/legal-review" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: legal-review-demo-2026-0001" \
   -H 'Content-Type: application/json' \
   -d '{
     "decision": "APPROVED",
-    "defamation_check_passed": true,
-    "privacy_check_passed": true,
-    "copyright_check_passed": true,
     "prohibited_checklist_passed": true,
-    "notes": "Verified primary government provenance and prohibited checklist."
+    "genuine_gaps_verified": true,
+    "license_audit_passed": true,
+    "external_counsel_ref": "COUNSEL-2026-001",
+    "notes": "Verified primary government provenance, genuine gaps, license audit, and prohibited checklist."
   }' | jq .
 ```
 
 ### 9.8 Publish case (enforced by PostgreSQL trigger)
 
-All evidence items must have `processing_status='COMPLETED'` (set by the Rust processor in Prompt 8d) and `prohibited_content_cleared=true`, and the case must have an `APPROVED` legal review and at least one entry in `genuine_gaps`. Otherwise PostgreSQL trigger `enforce_legal_review_before_publish` rejects the update and the API returns `422 Unprocessable Entity` with the exact PostgreSQL message.
+All evidence items must have `processing_status='COMPLETED'` (set by `processor-rust`) and `prohibited_content_cleared=true`, and the case must have an `APPROVED` legal review and at least one entry in `genuine_gaps`. Otherwise PostgreSQL trigger `enforce_legal_review_before_publish` rejects the update and the API returns `422 Unprocessable Entity` with the exact PostgreSQL message.
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/publish" \
-  -H "Authorization: Bearer $TOKEN" | jq .
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: publish-case-demo-2026-0001" | jq .
 ```
 
 ### 9.9 Retract a published case
@@ -335,9 +344,87 @@ curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/publish" \
 ```bash
 curl -sS -X POST "http://127.0.0.1:8080/api/v1/admin/cases/$CASE_ID/retract" \
   -H "Authorization: Bearer $TOKEN" \
+  -H "Idempotency-Key: retract-case-demo-2026-0001" \
   -H 'Content-Type: application/json' \
   -d '{"reason": "Pending court-ordered seal verification"}' | jq .
 ```
+
+---
+
+## 10. Running the Rust processor
+
+`processor-rust/` consumes jobs from the Redis Stream `evidence.process` (consumer group `processor-workers`), extracts UTF-8 text from uploaded evidence (`application/pdf`, `text/plain`, `image/png`, `image/jpeg`), runs OCR fallback for scanned documents when `tesseract` is installed, writes results back to PostgreSQL `evidence_items`, and routes permanent failures to `evidence.process.dead` + `audit_log`.
+
+### Prerequisites
+
+- Local PostgreSQL 15 and Redis 7 running via `make services-up` with migrations applied (`bash scripts/migrate.sh up`).
+- **Optional (for scanned PDF / image OCR):** Install Tesseract and Poppler on a standard Linux workstation or CI runner:
+  ```bash
+  sudo apt-get install -y tesseract-ocr poppler-utils
+  ```
+  If `tesseract` is not on `PATH` (such as inside the local sandbox), `processor-rust` starts normally with OCR disabled (`"tesseract":"missing"` on `/health`) and continues processing digital-text PDFs and plain-text exhibits. See `docs/23-decisions/ADR-017-ocr-strategy.md`.
+
+### Environment Variables
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `DATABASE_URL` | **Yes** | — | Must use `127.0.0.1` host locally (e.g. `postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable`) |
+| `REDIS_URL` | No | `redis://127.0.0.1:6379/0` | Must use `127.0.0.1` host locally |
+| `STORAGE_ROOT` | No | `./data/evidence` | Falls back to `LOCAL_STORAGE_ROOT`; must match `backend-go`'s `LOCAL_STORAGE_ROOT` |
+| `LOG_LEVEL` | No | `info` | Tracing filter (`debug`, `info`, `warn`, `error`) |
+| `WORKER_COUNT` | No | `2` | Concurrent Redis Streams consumers (`1`–`16`) |
+| `HEALTH_ADDR` | No | `127.0.0.1:9091` | Bind address for `GET /health` probe |
+
+### Start Locally
+
+```bash
+export PATH="/usr/local/go/bin:$HOME/go/bin:$HOME/.cargo/bin:$PATH"
+make services-up
+bash scripts/migrate.sh up
+
+cd processor-rust
+DATABASE_URL="postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable" \
+REDIS_URL="redis://127.0.0.1:6379/0" \
+STORAGE_ROOT="../data/evidence" \
+LOG_LEVEL="info" \
+WORKER_COUNT="2" \
+cargo run --bin processor
+```
+
+Verify the processor health endpoint in a second terminal:
+
+```bash
+curl -s http://127.0.0.1:9091/health
+# Expected: {"db":"ok","redis":"ok","status":"ok","tesseract":"missing"} (or "available")
+```
+
+### Observing Streams & Database Updates
+
+```bash
+# Inspect Redis Streams consumer group lag and pending entries
+redis-cli XINFO GROUPS evidence.process
+redis-cli XPENDING evidence.process processor-workers
+
+# Inspect dead-letter queue entries (permanent failures or retries > 3)
+redis-cli XRANGE evidence.process.dead - +
+
+# Inspect extracted evidence state in PostgreSQL
+psql "postgres://postgres@127.0.0.1:5432/truecrime_dev?sslmode=disable" \
+  -c "SELECT id, processing_status, page_count, ocr_used, left(extracted_text, 80) AS snippet FROM evidence_items ORDER BY updated_at DESC LIMIT 5;"
+```
+
+### Run Rust Formatting, Linting, Tests & Release Build
+
+```bash
+make services-up
+bash scripts/migrate.sh up
+cd processor-rust
+cargo fmt --check
+CARGO_BUILD_JOBS=2 cargo clippy --all-targets -- -D warnings
+CARGO_BUILD_JOBS=2 cargo test --all -- --nocapture
+CARGO_BUILD_JOBS=2 cargo build --release
+```
+
 
 
 

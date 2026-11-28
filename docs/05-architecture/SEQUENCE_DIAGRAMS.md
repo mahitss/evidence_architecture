@@ -116,47 +116,42 @@ sequenceDiagram
     Go->>Go: Verify Admin JWT + Redis denylist + Idempotency-Key cache
     Go->>Go: Validate 4x3 Matrix & Q5: NOT (source_type='third_party_exhibit' AND license_status='PUBLIC_DOMAIN')
 
-    alt Violates Q5, 4x3 Matrix, or missing license_record_id
-        Go-->>Admin: HTTP 422 { error: { code: "EVIDENCE_POLICY_BLOCKED", request_id } }
+    alt Violates Q5, 4x3 Matrix, or missing licensing_record_id / recreation fields
+        Go-->>Admin: HTTP 400 { error: { code: "Q5_VIOLATION|RECREATED_TIER_TOO_HIGH|LICENSING_RECORD_REQUIRED|RECREATION_FIELDS_REQUIRED", request_id } }
     else Policy valid & file <= 25 MB
-        Go->>Go: Stream bytes -> compute SHA-256 -> generate UUID object_key (ignore client filename)
-        Go->>S3: PutObject(object_key, bytes)
+        Go->>Go: Stream bytes -> compute SHA-256 -> generate UUID storage_key (ignore client filename)
+        Go->>S3: PutObject(storage_key, bytes)
         S3-->>Go: 200 OK
         Go->>PG: BEGIN; INSERT evidence_items (processing_status='PENDING', Q5 CHECK enforced) + INSERT audit_log; COMMIT
         PG-->>Go: Created evidence_id
-        Go->>Redis: XADD evidence:jobs MAXLEN ~ 10000 { job_id, evidence_id, case_id, object_key, expected_sha256, attempt: 1 }
+        Go->>Redis: XADD evidence.process MAXLEN ~ 10000 { job_id, evidence_id, storage_key, mime_type, case_id }
         Go->>Redis: Cache Idempotency-Key response (24h TTL)
-        Go-->>Admin: HTTP 201 { id, sha256_hash, processing_status: "PENDING", job_id }
+        Go-->>Admin: HTTP 202 { evidence_id, processing_status: "PENDING", job_published: true, sha256_hash, storage_key }
     end
 
     Note over Redis,Rust: Asynchronous Document Extraction Pipeline
-    Rust->>Redis: XREADGROUP GROUP rust-processors COUNT 1 BLOCK 5000 STREAMS evidence:jobs >
-    Redis-->>Rust: Job payload (job_id, object_key, expected_sha256)
-    Rust->>S3: GetObject(object_key)
-    S3-->>Rust: Raw file stream
-    Rust->>Rust: Verify SHA-256, magic bytes, bomb guards -> parse PDF -> OCR fallback if scanned
+    Rust->>Redis: XREADGROUP GROUP processor-workers COUNT 1 BLOCK 5000 STREAMS evidence.process >
+    Redis-->>Rust: Job payload (job_id, evidence_id, storage_key, mime_type, case_id)
+    Rust->>S3: GetObject(storage_key)
+    S3-->>Rust: Raw file bytes
+    Rust->>Rust: Validate & parse PDF text -> OCR fallback via tesseract subprocess if scanned
 
     alt Extraction succeeds
-        Rust->>Redis: XADD evidence:results MAXLEN ~ 10000 { job_id, evidence_id, status: "COMPLETED", extracted_text, page_count, ocr_used }
-        Rust->>Redis: XACK evidence:jobs rust-processors <msg_id>
-    else Terminal error (bomb/bad magic) OR attempt >= 3
-        Rust->>Redis: XADD evidence:dlq { job_id, evidence_id, error_code, error_detail }
-        Rust->>Redis: XADD evidence:results { job_id, evidence_id, status: "FAILED", error_code }
-        Rust->>Redis: XACK evidence:jobs rust-processors <msg_id>
+        Rust->>PG: UPDATE evidence_items SET processing_status='COMPLETED', extracted_text, page_count, ocr_used, last_processed_job_id
+        Rust->>Redis: XACK evidence.process processor-workers <msg_id>
+    else Permanent error (corrupt PDF, unsupported mime, OCR unavailable) OR retries > 3
+        Rust->>PG: UPDATE evidence_items SET processing_status='FAILED', last_processed_job_id + INSERT audit_log (evidence.processing_failed)
+        Rust->>Redis: XADD evidence.process.dead { job_id, evidence_id, storage_key, mime_type, case_id, error_reason }
+        Rust->>Redis: XACK evidence.process processor-workers <msg_id>
     end
 
-    Note over Go,Meili: Go Result Consumer Commits & Conditionally Indexes
-    Go->>Redis: XREADGROUP GROUP go-indexers STREAMS evidence:results >
-    Redis-->>Go: Result payload (job_id, evidence_id, status, extracted_text)
-    Go->>PG: Idempotent check (last_processed_job_id != job_id) -> UPDATE evidence_items SET extracted_text, processing_status, last_processed_job_id
-    PG-->>Go: Updated row + parent cases.status
+    Note over Go,Meili: Publish-Time Meilisearch Indexing (Drafts Never Indexed)
     alt Parent case status == 'PUBLISHED' AND status == 'COMPLETED'
         Go->>Meili: Upsert evidence document (case_status: "PUBLISHED", extracted_text)
         Meili-->>Go: 202 Accepted
     else Parent case is DRAFT / IN_REVIEW / APPROVED
         Go->>Go: Skip Meilisearch indexing (drafts never enter public search index)
     end
-    Go->>Redis: XACK evidence:results go-indexers <msg_id>
 ```
 
 ---

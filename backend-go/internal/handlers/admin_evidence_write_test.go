@@ -102,6 +102,7 @@ func TestAdminEvidenceWriteHandler_ValidationAndUpload(t *testing.T) {
 	rejectionCases := []struct {
 		name        string
 		fields      map[string]string
+		wantCode    string
 		wantMessage string
 	}{
 		{
@@ -113,6 +114,7 @@ func TestAdminEvidenceWriteHandler_ValidationAndUpload(t *testing.T) {
 				"verification_tier": "1",
 				"reported_as_date":  "2026-01-15",
 			},
+			wantCode:    "Q5_VIOLATION",
 			wantMessage: "Q5 violation: third-party exhibits cannot be PUBLIC_DOMAIN",
 		},
 		{
@@ -126,6 +128,7 @@ func TestAdminEvidenceWriteHandler_ValidationAndUpload(t *testing.T) {
 				"recreation_author_note": "Recreated chart",
 				"reported_as_date":       "2026-01-15",
 			},
+			wantCode:    "RECREATED_TIER_TOO_HIGH",
 			wantMessage: "Recreations cannot claim Tier 3+.",
 		},
 		{
@@ -137,6 +140,7 @@ func TestAdminEvidenceWriteHandler_ValidationAndUpload(t *testing.T) {
 				"verification_tier": "2",
 				"reported_as_date":  "2026-01-15",
 			},
+			wantCode:    "LICENSING_RECORD_REQUIRED",
 			wantMessage: "licensing_record_id is required",
 		},
 		{
@@ -148,6 +152,7 @@ func TestAdminEvidenceWriteHandler_ValidationAndUpload(t *testing.T) {
 				"verification_tier": "2",
 				"reported_as_date":  "2026-01-15",
 			},
+			wantCode:    "RECREATION_FIELDS_REQUIRED",
 			wantMessage: "recreation_source_ids is required",
 		},
 	}
@@ -186,6 +191,7 @@ func TestAdminEvidenceWriteHandler_ValidationAndUpload(t *testing.T) {
 
 			var env middleware.ErrorEnvelopeResponse
 			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &env))
+			assert.Equal(t, tc.wantCode, env.Error.Code)
 			assert.Contains(t, env.Error.Message, tc.wantMessage)
 		})
 	}

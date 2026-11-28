@@ -43,11 +43,8 @@ type recordLegalReviewRequest struct {
 	Decision                  string `json:"decision"`
 	ExternalCounselRef        string `json:"external_counsel_ref"`
 	ProhibitedChecklistPassed bool   `json:"prohibited_checklist_passed"`
-	DefamationCheckPassed     *bool  `json:"defamation_check_passed"`
-	PrivacyCheckPassed        *bool  `json:"privacy_check_passed"`
-	CopyrightCheckPassed      *bool  `json:"copyright_check_passed"`
-	GenuineGapsVerified       *bool  `json:"genuine_gaps_verified"`
-	LicenseAuditPassed        *bool  `json:"license_audit_passed"`
+	GenuineGapsVerified       bool   `json:"genuine_gaps_verified"`
+	LicenseAuditPassed        bool   `json:"license_audit_passed"`
 	Notes                     string `json:"notes"`
 }
 
@@ -84,28 +81,14 @@ func (h *AdminPublishHandler) RecordLegalReview(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	genuineGapsVerified := req.ProhibitedChecklistPassed
-	if req.GenuineGapsVerified != nil {
-		genuineGapsVerified = *req.GenuineGapsVerified
-	} else if req.DefamationCheckPassed != nil && req.PrivacyCheckPassed != nil {
-		genuineGapsVerified = *req.DefamationCheckPassed && *req.PrivacyCheckPassed
-	}
-
-	licenseAuditPassed := req.ProhibitedChecklistPassed
-	if req.LicenseAuditPassed != nil {
-		licenseAuditPassed = *req.LicenseAuditPassed
-	} else if req.CopyrightCheckPassed != nil {
-		licenseAuditPassed = *req.CopyrightCheckPassed
-	}
-
 	created, err := h.reviews.Create(r.Context(), store.CreateLegalReviewInput{
 		CaseID:                    caseID,
 		ReviewerID:                actorID,
 		ExternalCounselRef:        counselRef,
 		Decision:                  decision,
 		ProhibitedChecklistPassed: req.ProhibitedChecklistPassed,
-		GenuineGapsVerified:       genuineGapsVerified,
-		LicenseAuditPassed:        licenseAuditPassed,
+		GenuineGapsVerified:       req.GenuineGapsVerified,
+		LicenseAuditPassed:        req.LicenseAuditPassed,
 		Notes:                     req.Notes,
 	})
 	if err != nil {

@@ -120,7 +120,7 @@ func TestAdminPublishHandler_LegalReviewAndPublishGate(t *testing.T) {
 	})
 
 	t.Run("REJECTED legal review keeps case DRAFT and blocks publish with 422", func(t *testing.T) {
-		revBody := `{"decision":"REJECTED","external_counsel_ref":"COUNSEL-REJ-1","prohibited_checklist_passed":true,"defamation_check_passed":false,"privacy_check_passed":true,"copyright_check_passed":true,"notes":"Needs redaction"}`
+		revBody := `{"decision":"REJECTED","external_counsel_ref":"COUNSEL-REJ-1","prohibited_checklist_passed":true,"genuine_gaps_verified":false,"license_audit_passed":true,"notes":"Needs redaction"}`
 		revReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/cases/"+rejectedCaseID.String()+"/legal-review", strings.NewReader(revBody))
 		revReq.Header.Set("Authorization", "Bearer "+token)
 		revRec := httptest.NewRecorder()
@@ -135,8 +135,17 @@ func TestAdminPublishHandler_LegalReviewAndPublishGate(t *testing.T) {
 		assert.Equal(t, http.StatusUnprocessableEntity, pubRec.Code)
 	})
 
+	t.Run("legacy defamation/privacy/copyright field names are rejected with 400", func(t *testing.T) {
+		legacyBody := `{"decision":"APPROVED","external_counsel_ref":"COUNSEL-OLD","prohibited_checklist_passed":true,"defamation_check_passed":true}`
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/cases/"+approvedCaseID.String()+"/legal-review", strings.NewReader(legacyBody))
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		assert.Equal(t, http.StatusBadRequest, rec.Code)
+	})
+
 	t.Run("APPROVED legal review links published_legal_review_id and publish succeeds", func(t *testing.T) {
-		revBody := `{"decision":"APPROVED","external_counsel_ref":"COUNSEL-APP-1","prohibited_checklist_passed":true,"defamation_check_passed":true,"privacy_check_passed":true,"copyright_check_passed":true,"notes":"Cleared"}`
+		revBody := `{"decision":"APPROVED","external_counsel_ref":"COUNSEL-APP-1","prohibited_checklist_passed":true,"genuine_gaps_verified":true,"license_audit_passed":true,"notes":"Cleared"}`
 		revReq := httptest.NewRequest(http.MethodPost, "/api/v1/admin/cases/"+approvedCaseID.String()+"/legal-review", strings.NewReader(revBody))
 		revReq.Header.Set("Authorization", "Bearer "+token)
 		revRec := httptest.NewRecorder()

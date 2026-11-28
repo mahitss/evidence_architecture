@@ -157,7 +157,7 @@ func (h *AdminEvidenceWriteHandler) Upload(w http.ResponseWriter, r *http.Reques
 	recSourceIDsRaw := strings.TrimSpace(r.FormValue("recreation_source_ids"))
 	recAuthorNoteStr := strings.TrimSpace(r.FormValue("recreation_author_note"))
 
-	if errMsg := validateEvidenceIntegrityPolicy(
+	if errCode, errMsg := validateEvidenceIntegrityPolicy(
 		sourceType,
 		licenseStatus,
 		tier,
@@ -165,7 +165,7 @@ func (h *AdminEvidenceWriteHandler) Upload(w http.ResponseWriter, r *http.Reques
 		recSourceIDsRaw,
 		recAuthorNoteStr,
 	); errMsg != "" {
-		middleware.WriteError(w, r, http.StatusBadRequest, "EVIDENCE_POLICY_BLOCKED", errMsg)
+		middleware.WriteError(w, r, http.StatusBadRequest, errCode, errMsg)
 		return
 	}
 
@@ -433,11 +433,11 @@ func (h *AdminEvidenceWriteHandler) UpdateMetadata(w http.ResponseWriter, r *htt
 
 	// If the update payload specifies both fields of a prohibited combination, fail fast with 400.
 	if req.SourceType != nil && req.LicenseStatus != nil && *req.SourceType == "third_party_exhibit" && *req.LicenseStatus == "PUBLIC_DOMAIN" {
-		middleware.WriteError(w, r, http.StatusBadRequest, "EVIDENCE_POLICY_BLOCKED", "Q5 violation: third-party exhibits cannot be PUBLIC_DOMAIN. Use LICENSED or cite via a Tier 1 court opinion.")
+		middleware.WriteError(w, r, http.StatusBadRequest, "Q5_VIOLATION", "Q5 violation: third-party exhibits cannot be PUBLIC_DOMAIN. Use LICENSED or cite via a Tier 1 court opinion.")
 		return
 	}
 	if req.VerificationTier != nil && req.LicenseStatus != nil && (*req.VerificationTier == 3 || *req.VerificationTier == 4) && *req.LicenseStatus == "RECREATED" {
-		middleware.WriteError(w, r, http.StatusBadRequest, "EVIDENCE_POLICY_BLOCKED", "Recreations cannot claim Tier 3+.")
+		middleware.WriteError(w, r, http.StatusBadRequest, "RECREATED_TIER_TOO_HIGH", "Recreations cannot claim Tier 3+.")
 		return
 	}
 
@@ -502,32 +502,32 @@ func validateEvidenceIntegrityPolicy(
 	sourceType, licenseStatus string,
 	tier int16,
 	licensingRecordID, recSourceIDsRaw, recAuthorNote string,
-) string {
+) (string, string) {
 	// 1. Q5 Hard Rule: third_party_exhibit CANNOT be PUBLIC_DOMAIN.
 	if sourceType == "third_party_exhibit" && licenseStatus == "PUBLIC_DOMAIN" {
-		return "Q5 violation: third-party exhibits cannot be PUBLIC_DOMAIN. Use LICENSED or cite via a Tier 1 court opinion."
+		return "Q5_VIOLATION", "Q5 violation: third-party exhibits cannot be PUBLIC_DOMAIN. Use LICENSED or cite via a Tier 1 court opinion."
 	}
 	// 2. 4x3 Matrix Hard Rule (R1): RECREATED cannot claim Tier 3 or Tier 4.
 	if (tier == 3 || tier == 4) && licenseStatus == "RECREATED" {
-		return "Recreations cannot claim Tier 3+."
+		return "RECREATED_TIER_TOO_HIGH", "Recreations cannot claim Tier 3+."
 	}
 	// 3. LICENSED requires licensing_record_id.
 	if licenseStatus == "LICENSED" && licensingRecordID == "" {
-		return "licensing_record_id is required when license_status is LICENSED"
+		return "LICENSING_RECORD_REQUIRED", "licensing_record_id is required when license_status is LICENSED"
 	}
 	// 4. RECREATED requires non-empty recreation_source_ids and recreation_author_note.
 	if licenseStatus == "RECREATED" {
 		if recSourceIDsRaw == "" {
-			return "recreation_source_ids is required when license_status is RECREATED"
+			return "RECREATION_FIELDS_REQUIRED", "recreation_source_ids is required when license_status is RECREATED"
 		}
 		if _, err := normalizeRecreationSourceIDs(recSourceIDsRaw); err != nil {
-			return err.Error()
+			return "RECREATION_FIELDS_REQUIRED", err.Error()
 		}
 		if recAuthorNote == "" {
-			return "recreation_author_note is required when license_status is RECREATED"
+			return "RECREATION_FIELDS_REQUIRED", "recreation_author_note is required when license_status is RECREATED"
 		}
 	}
-	return ""
+	return "", ""
 }
 
 func normalizeRecreationSourceIDs(raw string) (json.RawMessage, error) {

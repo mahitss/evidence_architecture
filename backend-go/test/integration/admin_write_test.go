@@ -145,10 +145,15 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 		"genuine_gaps": [{"claim":"Offshore beneficiary list","why_unverified":"Exhibit remains under seal","highest_available_tier":"None"}]
 	}`, uniqueSlug)
 
+	newIdemKey := func() string {
+		return "int_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	}
+
 	createReq, err := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/cases", strings.NewReader(createBody))
 	require.NoError(t, err)
 	createReq.Header.Set("Authorization", authHeader)
 	createReq.Header.Set("Content-Type", "application/json")
+	createReq.Header.Set("Idempotency-Key", newIdemKey())
 	createResp, err := client.Do(createReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, createResp.StatusCode)
@@ -165,10 +170,11 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	assert.Equal(t, "DRAFT", createdCase.Status)
 	createdCaseID = createdCase.ID
 
-	// 2b. Verify duplicate slug returns 409 Conflict
+	// 2b. Verify duplicate slug returns 409 Conflict (distinct Idempotency-Key)
 	dupReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/cases", strings.NewReader(createBody))
 	dupReq.Header.Set("Authorization", authHeader)
 	dupReq.Header.Set("Content-Type", "application/json")
+	dupReq.Header.Set("Idempotency-Key", newIdemKey())
 	dupResp, err := client.Do(dupReq)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusConflict, dupResp.StatusCode)
@@ -178,6 +184,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	updReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/admin/cases/"+createdCaseID, strings.NewReader(`{"title":"Integration Write-Flow Case Updated"}`))
 	updReq.Header.Set("Authorization", authHeader)
 	updReq.Header.Set("Content-Type", "application/json")
+	updReq.Header.Set("Idempotency-Key", newIdemKey())
 	updResp, err := client.Do(updReq)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusOK, updResp.StatusCode)
@@ -249,6 +256,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	// 5. Attempt publish BEFORE legal review -> 422 with exact PostgreSQL trigger message
 	pubNoRevReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/cases/"+createdCaseID+"/publish", nil)
 	pubNoRevReq.Header.Set("Authorization", authHeader)
+	pubNoRevReq.Header.Set("Idempotency-Key", newIdemKey())
 	pubNoRevResp, err := client.Do(pubNoRevReq)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusUnprocessableEntity, pubNoRevResp.StatusCode)
@@ -270,6 +278,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	)
 	clearReq.Header.Set("Authorization", authHeader)
 	clearReq.Header.Set("Content-Type", "application/json")
+	clearReq.Header.Set("Idempotency-Key", newIdemKey())
 	clearResp, err := client.Do(clearReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, clearResp.StatusCode)
@@ -283,14 +292,14 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 		"decision": "APPROVED",
 		"external_counsel_ref": "COUNSEL-INT-8C-001",
 		"prohibited_checklist_passed": true,
-		"defamation_check_passed": true,
-		"privacy_check_passed": true,
-		"copyright_check_passed": true,
+		"genuine_gaps_verified": true,
+		"license_audit_passed": true,
 		"notes": "Integration test legal sign-off"
 	}`
 	revReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/cases/"+createdCaseID+"/legal-review", strings.NewReader(revBody))
 	revReq.Header.Set("Authorization", authHeader)
 	revReq.Header.Set("Content-Type", "application/json")
+	revReq.Header.Set("Idempotency-Key", newIdemKey())
 	revResp, err := client.Do(revReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, revResp.StatusCode)
@@ -299,6 +308,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	// 7. Publish case -> 200 PUBLISHED
 	pubReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/cases/"+createdCaseID+"/publish", nil)
 	pubReq.Header.Set("Authorization", authHeader)
+	pubReq.Header.Set("Idempotency-Key", newIdemKey())
 	pubResp, err := client.Do(pubReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, pubResp.StatusCode)
@@ -313,6 +323,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	editPubReq, _ := http.NewRequest(http.MethodPut, ts.URL+"/api/v1/admin/cases/"+createdCaseID, strings.NewReader(`{"title":"Should Fail"}`))
 	editPubReq.Header.Set("Authorization", authHeader)
 	editPubReq.Header.Set("Content-Type", "application/json")
+	editPubReq.Header.Set("Idempotency-Key", newIdemKey())
 	editPubResp, err := client.Do(editPubReq)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusConflict, editPubResp.StatusCode)
@@ -326,6 +337,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	)
 	evMutReq.Header.Set("Authorization", authHeader)
 	evMutReq.Header.Set("Content-Type", "application/json")
+	evMutReq.Header.Set("Idempotency-Key", newIdemKey())
 	evMutResp, err := client.Do(evMutReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, evMutResp.StatusCode)
@@ -350,6 +362,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	revReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/cases/"+createdCaseID+"/legal-review", strings.NewReader(revBody))
 	revReq2.Header.Set("Authorization", authHeader)
 	revReq2.Header.Set("Content-Type", "application/json")
+	revReq2.Header.Set("Idempotency-Key", newIdemKey())
 	revResp2, err := client.Do(revReq2)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusCreated, revResp2.StatusCode)
@@ -357,6 +370,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 
 	pubReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/v1/admin/cases/"+createdCaseID+"/publish", nil)
 	pubReq2.Header.Set("Authorization", authHeader)
+	pubReq2.Header.Set("Idempotency-Key", newIdemKey())
 	pubResp2, err := client.Do(pubReq2)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, pubResp2.StatusCode)
@@ -369,6 +383,7 @@ func TestAdminWriteWorkflow_EndToEndAgainstRealPostgresAndRedis(t *testing.T) {
 	)
 	retReq.Header.Set("Authorization", authHeader)
 	retReq.Header.Set("Content-Type", "application/json")
+	retReq.Header.Set("Idempotency-Key", newIdemKey())
 	retResp, err := client.Do(retReq)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, retResp.StatusCode)
@@ -434,6 +449,7 @@ func postMultipartEvidence(t *testing.T, client *http.Client, url, authHeader st
 	require.NoError(t, err)
 	req.Header.Set("Authorization", authHeader)
 	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Idempotency-Key", "ev_"+strings.ReplaceAll(uuid.NewString(), "-", ""))
 
 	resp, err := client.Do(req)
 	require.NoError(t, err)

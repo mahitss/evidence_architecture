@@ -265,6 +265,9 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminLoginResponse'
+              example:
+                token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJleHAiOjE3OTU5MDAwMDB9.signature
+                expires_at: '2026-11-27T20:00:00Z'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
         '429':
@@ -281,10 +284,12 @@ paths:
         Creates a new case initialized strictly in `DRAFT` status (invisible on public routes).
         **Auth:** Bearer JWT (`ADMIN` role).
         **Rate Limit:** 30 requests/minute per admin token.
-        **Idempotency:** Unique `slug` constraint prevents duplicate creation (`HTTP 409`).
+        **Idempotency:** Requires `Idempotency-Key` header (`^[A-Za-z0-9_-]{16,64}$`, 24h Redis cache); unique `slug` constraint also prevents duplicate creation (`HTTP 409`).
       x-rate-limit: 30 req/min per admin
       security:
         - AdminBearerJWT: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
       requestBody:
         required: true
         content:
@@ -318,12 +323,13 @@ paths:
         Updates an existing case. If the case is currently `PUBLISHED`, substantive updates require re-review or explicit correction logging; cannot bypass `legal_review_records` to set `status = PUBLISHED`.
         **Auth:** Bearer JWT (`ADMIN` role).
         **Rate Limit:** 60 requests/minute per admin token.
-        **Idempotency:** Idempotent PUT (full resource replacement of mutable fields).
+        **Idempotency:** Requires `Idempotency-Key` header (`^[A-Za-z0-9_-]{16,64}$`, 24h Redis cache).
       x-rate-limit: 60 req/min per admin
       security:
         - AdminBearerJWT: []
       parameters:
         - $ref: '#/components/parameters/CaseIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
       requestBody:
         required: true
         content:
@@ -345,24 +351,26 @@ paths:
           $ref: '#/components/responses/ForbiddenError'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
         '422':
           $ref: '#/components/responses/UnprocessableError'
 
   # MANDATORY Q5 DATABASE & API CHECK CONSTRAINT (PO Decision Q5 / EVIDENCE_INTEGRITY_SPEC.md §2):
   # NOT (source_type = 'third_party_exhibit' AND license_status = 'PUBLIC_DOMAIN')
-  # Any evidence upload violating this rule MUST be rejected with HTTP 422 (EVIDENCE_POLICY_BLOCKED)
-  # AND is independently enforced at the PostgreSQL layer via CHECK constraint on evidence_items.
+  # Any evidence upload violating this rule is rejected fail-fast by the HTTP handler with HTTP 400 (Q5_VIOLATION)
+  # AND is independently enforced at the PostgreSQL layer via CHECK constraint on evidence_items (HTTP 422 fallback).
   /api/v1/admin/cases/{id}/evidence:
     post:
       tags: [Admin]
       operationId: adminUploadEvidence
       summary: Upload evidence file and metadata (triggers async Rust extraction)
       description: |
-        Accepts `multipart/form-data` containing the binary file (<= 25 MB: PDF, PNG, JPEG, or plain text) and structured metadata JSON.
-        Enforces the 4x3 Verification Tier x License Status matrix and PO Decision Q5 (`NOT (source_type = 'third_party_exhibit' AND license_status = 'PUBLIC_DOMAIN')`) before uploading to S3, writing `evidence_items` (`processing_status = PENDING`), and publishing a job to Redis Streams (`evidence:jobs`).
+        Accepts `multipart/form-data` containing the binary file (<= 25 MB: PDF, PNG, JPEG, or plain text) and structured metadata fields.
+        Enforces the 4x3 Verification Tier x License Status matrix and PO Decision Q5 (`NOT (source_type = 'third_party_exhibit' AND license_status = 'PUBLIC_DOMAIN')`) fail-fast (HTTP 400) before uploading to object storage, writing `evidence_items` (`processing_status = PENDING`), and publishing a job to Redis Streams (`evidence.process`).
         **Auth:** Bearer JWT (`ADMIN` role).
         **Rate Limit:** 20 uploads/minute per admin token (max 4 concurrent uploads via server semaphore).
-        **Idempotency:** Requires `Idempotency-Key` header (24-hour Redis deduplication window preventing duplicate S3 objects and Redis jobs).
+        **Idempotency:** Requires `Idempotency-Key` header (`^[A-Za-z0-9_-]{16,64}$`, 24-hour Redis deduplication window preventing duplicate storage objects and Redis jobs).
       x-rate-limit: 20 req/min per admin
       security:
         - AdminBearerJWT: []
@@ -376,24 +384,74 @@ paths:
             schema:
               $ref: '#/components/schemas/AdminEvidenceUploadRequest'
       responses:
-        '201':
-          description: Evidence persisted and extraction job enqueued.
+        '202':
+          description: Evidence persisted (`PENDING`) and extraction job published to Redis Stream `evidence.process`.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminEvidenceResponse'
+              example:
+                evidence_id: 550e8400-e29b-41d4-a716-446655440000
+                processing_status: PENDING
+                job_published: true
+                sha256_hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+                storage_key: cases/10000000-0000-0000-0000-000000000001/evidence/550e8400-e29b-41d4-a716-446655440000/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.pdf
         '400':
-          $ref: '#/components/responses/BadRequestError'
+          description: Malformed request or handler-level Evidence Integrity policy violation caught fail-fast before DB/storage writes (`Q5_VIOLATION`, `RECREATED_TIER_TOO_HIGH`, `LICENSING_RECORD_REQUIRED`, `RECREATION_FIELDS_REQUIRED`, `MISSING_IDEMPOTENCY_KEY`, `INVALID_IDEMPOTENCY_KEY`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              examples:
+                q5Violation:
+                  summary: Q5 violation (third-party exhibit marked PUBLIC_DOMAIN)
+                  value:
+                    error:
+                      code: Q5_VIOLATION
+                      message: 'Q5 violation: third-party exhibits cannot be PUBLIC_DOMAIN. Use LICENSED or cite via a Tier 1 court opinion.'
+                      request_id: 7a9f2d41-6b12-4c31-9e10-8a5c1d2b3e4f
+                recreatedTierTooHigh:
+                  summary: Recreated evidence claiming Verification Tier 3 or 4
+                  value:
+                    error:
+                      code: RECREATED_TIER_TOO_HIGH
+                      message: Recreations cannot claim Tier 3+.
+                      request_id: 7a9f2d41-6b12-4c31-9e10-8a5c1d2b3e4f
+                licensingRecordRequired:
+                  summary: LICENSED evidence missing licensing_record_id
+                  value:
+                    error:
+                      code: LICENSING_RECORD_REQUIRED
+                      message: licensing_record_id is required when license_status is LICENSED
+                      request_id: 7a9f2d41-6b12-4c31-9e10-8a5c1d2b3e4f
+                recreationFieldsRequired:
+                  summary: RECREATED evidence missing recreation_source_ids or recreation_author_note
+                  value:
+                    error:
+                      code: RECREATION_FIELDS_REQUIRED
+                      message: recreation_source_ids is required when license_status is RECREATED
+                      request_id: 7a9f2d41-6b12-4c31-9e10-8a5c1d2b3e4f
         '401':
           $ref: '#/components/responses/UnauthorizedError'
         '403':
           $ref: '#/components/responses/ForbiddenError'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
         '413':
           $ref: '#/components/responses/PayloadTooLargeError'
         '422':
-          $ref: '#/components/responses/UnprocessableError'
+          description: Database-level CHECK or trigger constraint rejection (server bug — handler-level validation should catch policy violations first with HTTP 400).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+              example:
+                error:
+                  code: EVIDENCE_POLICY_BLOCKED
+                  message: 'new row for relation "evidence_items" violates check constraint "chk_no_third_party_public_domain"'
+                  request_id: 7a9f2d41-6b12-4c31-9e10-8a5c1d2b3e4f
         '503':
           $ref: '#/components/responses/ServiceUnavailableError'
 
@@ -404,15 +462,16 @@ paths:
       summary: Update evidence metadata (triggers re-review if parent case is PUBLISHED)
       description: |
         Updates mutable metadata fields on an evidence item (enforcing Q5 and 4x3 Display Rules Matrix).
-        **Security & Integrity Rule (T6):** If the parent case is currently `PUBLISHED`, any change to `verification_tier`, `license_status`, `source_type`, `source_citation`, or `prohibited_content_cleared` atomically transitions the parent case back to `IN_REVIEW`, removes it from the public Meilisearch index, and writes an `EVIDENCE_UPDATED_REREVIEW` entry to `audit_log` so unreviewed edits cannot silently appear live.
+        **Security & Integrity Rule (T6):** If the parent case is currently `PUBLISHED`, any change to `verification_tier`, `license_status`, `source_type`, `source_citation`, or `prohibited_content_cleared` atomically transitions the parent case back to `IN_REVIEW`, removes it from the public Meilisearch index, and writes an `evidence.updated` entry to `audit_log` so unreviewed edits cannot silently appear live.
         **Auth:** Bearer JWT (`ADMIN` role).
         **Rate Limit:** 30 requests/minute per admin token.
-        **Idempotency:** Idempotent PUT.
+        **Idempotency:** Requires `Idempotency-Key` header (`^[A-Za-z0-9_-]{16,64}$`, 24h Redis cache).
       x-rate-limit: 30 req/min per admin
       security:
         - AdminBearerJWT: []
       parameters:
         - $ref: '#/components/parameters/EvidenceIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
       requestBody:
         required: true
         content:
@@ -434,6 +493,8 @@ paths:
           $ref: '#/components/responses/ForbiddenError'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
         '422':
           $ref: '#/components/responses/UnprocessableError'
 
@@ -443,15 +504,16 @@ paths:
       operationId: adminRecordLegalReview
       summary: Record external legal counsel sign-off for a case
       description: |
-        Inserts an immutable `legal_review_records` row documenting external legal counsel review (`external_counsel_ref`, `decision`, checklists, `reviewed_at`). If `decision = APPROVED`, transitions case to `APPROVED` (ready for `POST /publish`).
+        Inserts an immutable `legal_review_records` row documenting external legal counsel review (`external_counsel_ref`, `decision`, `prohibited_checklist_passed`, `genuine_gaps_verified`, `license_audit_passed`, `notes`). If `decision = APPROVED`, links `cases.published_legal_review_id` (ready for `POST /publish`).
         **Auth:** Bearer JWT (`ADMIN` role).
         **Rate Limit:** 20 requests/minute per admin token.
-        **Idempotency:** Non-idempotent append of immutable review history.
+        **Idempotency:** Requires `Idempotency-Key` header (`^[A-Za-z0-9_-]{16,64}$`, 24h Redis cache preventing duplicate review rows on retry).
       x-rate-limit: 20 req/min per admin
       security:
         - AdminBearerJWT: []
       parameters:
         - $ref: '#/components/parameters/CaseIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
       requestBody:
         required: true
         content:
@@ -473,6 +535,8 @@ paths:
           $ref: '#/components/responses/ForbiddenError'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
         '422':
           $ref: '#/components/responses/UnprocessableError'
 
@@ -506,12 +570,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminCaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
         '403':
           $ref: '#/components/responses/ForbiddenError'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
         '422':
           $ref: '#/components/responses/UnprocessableError'
         '503':
@@ -523,15 +591,16 @@ paths:
       operationId: adminRetractCase
       summary: Emergency kill-switch to immediately retract a published case
       description: |
-        Immediately transitions case status to `RETRACTED` in PostgreSQL, appends an immutable `audit_log` entry with mandatory `reason_code`, and removes case + evidence documents from Meilisearch (effective <= 60s; REQ-031).
+        Immediately transitions case status to `RETRACTED` in PostgreSQL, appends an immutable `audit_log` entry with mandatory `reason`, and removes case + evidence documents from Meilisearch (effective <= 60s; REQ-031).
         **Auth:** Bearer JWT (`ADMIN` role).
         **Rate Limit:** 20 requests/minute per admin token.
-        **Idempotency:** Safe to repeat on an already-retracted case (returns HTTP 200 with current retracted state).
+        **Idempotency:** Requires `Idempotency-Key` header (`^[A-Za-z0-9_-]{16,64}$`, 24h Redis cache).
       x-rate-limit: 20 req/min per admin
       security:
         - AdminBearerJWT: []
       parameters:
         - $ref: '#/components/parameters/CaseIdParam'
+        - $ref: '#/components/parameters/IdempotencyKeyHeader'
       requestBody:
         required: true
         content:
@@ -545,12 +614,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AdminCaseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequestError'
         '401':
           $ref: '#/components/responses/UnauthorizedError'
         '403':
           $ref: '#/components/responses/ForbiddenError'
         '404':
           $ref: '#/components/responses/NotFoundError'
+        '409':
+          $ref: '#/components/responses/ConflictError'
         '422':
           $ref: '#/components/responses/UnprocessableError'
 
@@ -599,10 +672,12 @@ components:
       name: Idempotency-Key
       in: header
       required: true
-      description: Client-generated UUIDv4/v7 ensuring at-most-once execution across network retries (24-hour TTL in Redis).
+      description: Client-generated idempotency key matching `^[A-Za-z0-9_-]{16,64}$` ensuring at-most-once execution across network retries (24-hour TTL in Redis under `idem:{key}`). Missing header returns HTTP 400 (`MISSING_IDEMPOTENCY_KEY`); invalid format returns HTTP 400 (`INVALID_IDEMPOTENCY_KEY`); reuse with a different request body returns HTTP 409 (`IDEMPOTENCY_CONFLICT`).
       schema:
         type: string
-        format: uuid
+        minLength: 16
+        maxLength: 64
+        pattern: '^[A-Za-z0-9_-]{16,64}$'
 
   responses:
     BadRequestError:
@@ -1060,16 +1135,17 @@ components:
 
     AdminLoginResponse:
       type: object
-      required: [access_token, token_type, expires_at]
+      required: [token, expires_at]
       properties:
-        access_token:
+        token:
           type: string
-        token_type:
-          type: string
-          enum: [Bearer]
+          description: Signed HS256 Bearer JWT for internal admin endpoints.
         expires_at:
           type: string
           format: date-time
+      example:
+        token: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIwMDAwMDAwMC0wMDAwLTAwMDAtMDAwMC0wMDAwMDAwMDAwMDEiLCJleHAiOjE3OTU5MDAwMDB9.signature
+        expires_at: '2026-11-27T20:00:00Z'
 
     AdminCaseWriteRequest:
       type: object
@@ -1196,34 +1272,27 @@ components:
 
     AdminEvidenceResponse:
       type: object
-      required: [id, case_id, title, source_type, verification_tier, license_status, sha256_hash, processing_status, job_id, created_at]
+      required: [evidence_id, processing_status, job_published, sha256_hash, storage_key]
       properties:
-        id:
+        evidence_id:
           type: string
           format: uuid
-        case_id:
+        processing_status:
           type: string
-          format: uuid
-        title:
-          type: string
-        source_type:
-          $ref: '#/components/schemas/SourceType'
-        verification_tier:
-          $ref: '#/components/schemas/VerificationTier'
-        license_status:
-          $ref: '#/components/schemas/LicenseStatus'
+          enum: [PENDING]
+        job_published:
+          type: boolean
         sha256_hash:
           type: string
           pattern: '^[a-f0-9]{64}$'
-        processing_status:
+        storage_key:
           type: string
-          enum: [PENDING, COMPLETED, FAILED]
-        job_id:
-          type: string
-          format: uuid
-        created_at:
-          type: string
-          format: date-time
+      example:
+        evidence_id: 550e8400-e29b-41d4-a716-446655440000
+        processing_status: PENDING
+        job_published: true
+        sha256_hash: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        storage_key: cases/10000000-0000-0000-0000-000000000001/evidence/550e8400-e29b-41d4-a716-446655440000/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.pdf
 
     AdminEvidenceUpdateRequest:
       type: object
@@ -1279,20 +1348,19 @@ components:
     LegalReviewCreateRequest:
       type: object
       required:
-        - external_counsel_ref
         - decision
+        - external_counsel_ref
         - prohibited_checklist_passed
         - genuine_gaps_verified
         - license_audit_passed
-        - reviewed_at
       properties:
+        decision:
+          type: string
+          enum: [APPROVED, CHANGES_REQUESTED, REJECTED]
         external_counsel_ref:
           type: string
           minLength: 3
           maxLength: 200
-        decision:
-          type: string
-          enum: [APPROVED, CHANGES_REQUESTED, REJECTED]
         prohibited_checklist_passed:
           type: boolean
         genuine_gaps_verified:
@@ -1302,9 +1370,6 @@ components:
         notes:
           type: string
           maxLength: 4000
-        reviewed_at:
-          type: string
-          format: date-time
 
     LegalReviewResponse:
       type: object

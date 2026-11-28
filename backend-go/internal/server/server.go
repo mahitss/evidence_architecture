@@ -19,8 +19,13 @@ import (
 	"github.com/mahitss/evidence_architecture/backend-go/internal/server/middleware"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/storage"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/store"
+	"github.com/redis/go-redis/v9"
 	"github.com/rs/zerolog"
 )
+
+type redisClientProvider interface {
+	Client() *redis.Client
+}
 
 // Server encapsulates the HTTP router, dependencies, and lifecycle management.
 type Server struct {
@@ -42,13 +47,31 @@ func New(cfg config.Config, st *store.Store) (*Server, error) {
 }
 
 // NewWithDeps constructs a Server with explicit Storage and EvidencePublisher dependencies.
-// Middleware order: requestid -> logging -> recoverer -> errorenvelope -> router
-// (JWT strictly on protected /api/v1/admin/* endpoints).
+// If publisher exposes a *redis.Client, RedisIdempotencyStore is wired automatically.
 func NewWithDeps(
 	cfg config.Config,
 	st *store.Store,
 	objStorage storage.Storage,
 	publisher queue.EvidencePublisher,
+) (*Server, error) {
+	var idemStore middleware.IdempotencyStore
+	if provider, ok := publisher.(redisClientProvider); ok && provider != nil {
+		if rc := provider.Client(); rc != nil {
+			idemStore = middleware.NewRedisIdempotencyStore(rc)
+		}
+	}
+	return NewWithIdempotency(cfg, st, objStorage, publisher, idemStore)
+}
+
+// NewWithIdempotency constructs a Server with explicit Storage, EvidencePublisher, and IdempotencyStore dependencies.
+// Middleware order: requestid -> logging -> recoverer -> errorenvelope -> router
+// (JWT on protected /api/v1/admin/* endpoints; Idempotency-Key strictly on mutating write endpoints).
+func NewWithIdempotency(
+	cfg config.Config,
+	st *store.Store,
+	objStorage storage.Storage,
+	publisher queue.EvidencePublisher,
+	idemStore middleware.IdempotencyStore,
 ) (*Server, error) {
 	if st == nil {
 		return nil, errors.New("store must not be nil")
@@ -101,28 +124,37 @@ func NewWithDeps(
 	// Public health probe (no auth)
 	r.Get("/health", healthHandler.ServeHTTP)
 
+	// NOTE: When POST /api/v1/corrections is added in Prompt 8e, wrap it with middleware.Idempotency(idemStore).
+
 	// Admin API routes
 	r.Route("/api/v1/admin", func(ar chi.Router) {
-		// Unauthenticated login endpoint with in-memory IP rate limit
+		// Unauthenticated login endpoint with in-memory IP rate limit (not idempotent)
 		ar.Post("/login", authHandler.Login)
 
-		// JWT-protected admin read & write routes
+		// JWT-protected admin routes
 		ar.Group(func(protected chi.Router) {
 			protected.Use(middleware.RequireAdminJWT(jwtManager))
 
-			// Cases
-			protected.Post("/cases", adminCaseWriteHandler.Create)
+			// Read-only admin routes (no Idempotency-Key required)
 			protected.Get("/cases/{id}", adminCasesHandler.GetByID)
-			protected.Put("/cases/{id}", adminCaseWriteHandler.Update)
-			protected.Post("/cases/{id}/retract", adminCaseWriteHandler.Retract)
 
-			// Evidence
-			protected.Post("/cases/{id}/evidence", adminEvidenceWriteHandler.Upload)
-			protected.Put("/evidence/{id}", adminEvidenceWriteHandler.UpdateMetadata)
+			// Mutating admin write routes (Idempotency-Key middleware enforced on all 7 endpoints)
+			protected.Group(func(idempotent chi.Router) {
+				idempotent.Use(middleware.Idempotency(idemStore))
 
-			// Legal review & publish gate
-			protected.Post("/cases/{id}/legal-review", adminPublishHandler.RecordLegalReview)
-			protected.Post("/cases/{id}/publish", adminPublishHandler.Publish)
+				// Cases
+				idempotent.Post("/cases", adminCaseWriteHandler.Create)
+				idempotent.Put("/cases/{id}", adminCaseWriteHandler.Update)
+				idempotent.Post("/cases/{id}/retract", adminCaseWriteHandler.Retract)
+
+				// Evidence
+				idempotent.Post("/cases/{id}/evidence", adminEvidenceWriteHandler.Upload)
+				idempotent.Put("/evidence/{id}", adminEvidenceWriteHandler.UpdateMetadata)
+
+				// Legal review & publish gate
+				idempotent.Post("/cases/{id}/legal-review", adminPublishHandler.RecordLegalReview)
+				idempotent.Post("/cases/{id}/publish", adminPublishHandler.Publish)
+			})
 		})
 	})
 
