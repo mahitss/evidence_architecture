@@ -1,0 +1,71 @@
+:root {
+  /* Core archival case-file palette */
+  --surface-dark: #0f1115;
+  --surface-light: #fafaf7;
+  --ink: #1a1a1a;
+  --paper: #e8e3d5;
+  --accent: #8b6f47;
+  --accent-muted: #a08864;
+  --danger: #a94442;
+  --warning: #b8860b;
+  --success: #2d6a4f;
+  --border: #2a2d34;
+  --muted: #6b6d73;
+
+  /* WCAG AA verified companion surface & foreground tokens (>= 4.5:1) */
+  --surface-card: #f2eee2;
+  --surface-card-hover: #ebe5d5;
+  --surface-border-subtle: #cfc8b6;
+  --surface-border-strong: #9f9682;
+  --ink-secondary: #494b52;
+  --ink-on-paper-muted: #52545b;
+  --ink-on-dark: #fafaf7;
+  --ink-on-dark-muted: #c2c5ce;
+  --accent-hover: #735a38;
+  --accent-text: #6a5231;
+
+  /* Semantic badge / callout pairs (all >= 5.2:1 text contrast) */
+  --t1-bg: #e7f4ec;
+  --t1-border: #2d6a4f;
+  --t1-text: #1b4d37;
+
+  --t2-bg: #e8f1fa;
+  --t2-border: #275d94;
+  --t2-text: #1a4573;
+
+  --t3-bg: #fdf5df;
+  --t3-border: #b8860b;
+  --t3-text: #6e4e00;
+
+  --t4-bg: #ecebe7;
+  --t4-border: #6b6d73;
+  --t4-text: #3d3f45;
+
+  --danger-bg: #fbeeed;
+  --danger-border: #a94442;
+  --danger-text: #842a28;
+
+  /* Typography */
+  --font-serif: 'Iowan Old Style', 'Charter', Georgia, serif;
+  --font-sans: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', 'Consolas', monospace;
+
+  /* Spacing scale (4px -> 48px) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Radius (restrained archival geometry) */
+  --radius-sm: 2px;
+  --radius-md: 4px;
+
+  /* Motion (never exceeds 300ms) */
+  --duration-fast: 150ms;
+  --duration-normal: 250ms;
+}

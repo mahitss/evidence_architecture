@@ -507,3 +507,44 @@ curl -i -sS -X POST "http://127.0.0.1:8080/api/v1/corrections" \
 curl -i -sS -H "CF-IPCountry: DE" "http://127.0.0.1:8080/api/v1/cases"
 # Expected HTTP 451 Unavailable For Legal Reasons with static HTML ("Not available in your region")
 ```
+
+---
+
+## 13. Running the Mobile-Web PWA Reader (`mobile-web/`)
+
+The public-facing reader PWA (`ADR-006`, `ADR-007`, `ADR-008`, `ADR-014`) lives in `mobile-web/` and connects anonymously to the Go Reader API (`http://127.0.0.1:8080`).
+
+### Environment Variables (`mobile-web/.env.example`)
+
+| Variable | Required | Default | Notes |
+|---|---|---|---|
+| `VITE_API_URL` | No | `http://127.0.0.1:8080` | Base URL for `backend-go` public Reader API (no trailing slash) |
+
+### Start Locally (Development)
+
+Ensure `backend-go` is running on `http://127.0.0.1:8080` (§8), then run:
+
+```bash
+cd mobile-web
+npm install
+npm run dev
+# Serves on http://127.0.0.1:5173
+```
+
+### Run Unit, Route (MSW), and Accessibility (`axe-core`) Tests
+
+```bash
+cd mobile-web
+npm run typecheck
+npm test
+```
+
+### Production Build & PWA Preview
+
+```bash
+cd mobile-web
+npm run build
+npm run preview
+# Serves production bundle + manifest.webmanifest + sw.js on http://127.0.0.1:4173
+```
+
