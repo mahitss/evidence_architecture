@@ -38,11 +38,11 @@ paths:
       summary: List published cases (cursor-paginated)
       description: |
         Returns cursor-paginated published case summaries filterable by launch category.
-        **Auth:** None (anonymous; EU/EEA geoblocked at edge/middleware -> HTTP 451).
-        **Rate Limit:** 120 requests/minute per IP.
+        **Auth:** None (anonymous; EU/EEA/UK geoblocked at edge/middleware -> HTTP 451).
+        **Rate Limit:** 60 requests/minute per IP.
         **Idempotency:** Safe, idempotent GET.
         **Security Note:** Public callers can only retrieve `PUBLISHED` cases; passing any non-`PUBLISHED` `status` query value returns HTTP 400 or empty set (never leaks drafts).
-      x-rate-limit: 120 req/min per IP
+      x-rate-limit: 60 req/min per IP
       security: []
       parameters:
         - name: category
@@ -84,11 +84,11 @@ paths:
       summary: Get published case dossier detail with evidence list and timeline
       description: |
         Returns the full published case dossier including Official Briefing, mandatory Genuine Gaps, ordered timeline events, evidence item summaries, and public corrections log.
-        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
-        **Rate Limit:** 120 requests/minute per IP.
+        **Auth:** None (anonymous; EU/EEA/UK geoblocked -> HTTP 451).
+        **Rate Limit:** 60 requests/minute per IP.
         **Idempotency:** Safe, idempotent GET.
         **Security Note (T1):** Draft, in-review, approved, retracted, or non-existent slugs MUST return an identical HTTP 404 response.
-      x-rate-limit: 120 req/min per IP
+      x-rate-limit: 60 req/min per IP
       security: []
       parameters:
         - name: slug
@@ -122,11 +122,11 @@ paths:
       summary: Get published evidence metadata and short-lived signed file URL
       description: |
         Returns evidence metadata, Verification Tier and License Status display rules, SHA-256 hash, source citation, and a short-lived (<= 300s) pre-signed S3-compatible GET URL.
-        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
-        **Rate Limit:** 60 requests/minute per IP.
+        **Auth:** None (anonymous; EU/EEA/UK geoblocked -> HTTP 451).
+        **Rate Limit:** 120 requests/minute per IP.
         **Idempotency:** Safe, idempotent GET (mints fresh pre-signed URL per call).
         **Security Note:** Returns HTTP 404 if parent case is not `PUBLISHED`; returns redacted tombstone metadata with `signed_file_url: null` if item was redacted via kill-switch.
-      x-rate-limit: 60 req/min per IP
+      x-rate-limit: 120 req/min per IP
       security: []
       parameters:
         - $ref: '#/components/parameters/EvidenceIdParam'
@@ -152,9 +152,9 @@ paths:
       operationId: searchPublishedContent
       summary: Full-text search across published cases, extracted evidence text, and OCR output
       description: |
-        Queries self-hosted Meilisearch (ADR-012) across published case titles, summaries, extracted PDF text, and OCR text.
-        Server unconditionally injects `case_status = "PUBLISHED"` filter; user-supplied filter strings are never interpolated raw into Meilisearch filter expressions (T5).
-        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
+        Queries self-hosted Meilisearch (ADR-012, ADR-019) across published case titles, summaries, evidence titles, and extracted PDF/OCR text.
+        Server unconditionally injects `status = "PUBLISHED"` filter; user-supplied filter strings are never interpolated raw into Meilisearch filter expressions (T5).
+        **Auth:** None (anonymous; EU/EEA/UK geoblocked -> HTTP 451).
         **Rate Limit:** 30 requests/minute per IP.
         **Idempotency:** Safe, idempotent GET.
       x-rate-limit: 30 req/min per IP
@@ -207,12 +207,12 @@ paths:
       operationId: submitCorrectionRequest
       summary: Submit a public correction, defamation/copyright takedown, or privacy grievance
       description: |
-        Persists a correction/takedown request in PostgreSQL and returns a unique tracking `ticket_id` (no outbound email at MVP; reviewed in Admin Web).
-        Includes a hidden honeypot field (`website`); non-empty honeypot submissions are silently rejected/dropped without persisting spam (T4).
-        **Auth:** None (anonymous; EU/EEA geoblocked -> HTTP 451).
-        **Rate Limit:** 5 requests/hour per IP (HTTP 429 with `Retry-After`).
-        **Idempotency:** Requires `Idempotency-Key` header (UUIDv4/v7; 24-hour Redis deduplication window).
-      x-rate-limit: 5 req/hour per IP
+        Persists a correction/takedown request in PostgreSQL and returns a unique `correction_id` and tracking `ticket_id` (no outbound email at MVP; reviewed in Admin Web).
+        Includes hidden honeypot fields (`honeypot_field` / `website`); non-empty honeypot submissions silently return HTTP 202 without writing to PostgreSQL (T4).
+        **Auth:** None (anonymous; EU/EEA/UK geoblocked -> HTTP 451).
+        **Rate Limit:** 3 requests/hour per IP (HTTP 429 with `Retry-After`; fail-closed).
+        **Idempotency:** Requires `Idempotency-Key` header (16–64 alphanumeric/hyphen/underscore chars; 24-hour Redis deduplication window).
+      x-rate-limit: 3 req/hour per IP
       security: []
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyHeader'
@@ -223,8 +223,8 @@ paths:
             schema:
               $ref: '#/components/schemas/CorrectionCreateRequest'
       responses:
-        '201':
-          description: Correction request accepted and persisted.
+        '202':
+          description: Correction request accepted (persisted unless silently dropped by honeypot).
           content:
             application/json:
               schema:
@@ -1083,7 +1083,7 @@ components:
 
     CorrectionCreateRequest:
       type: object
-      required: [request_type, requester_contact_email, description]
+      required: [description]
       properties:
         case_slug:
           type: [string, 'null']
@@ -1093,8 +1093,12 @@ components:
         request_type:
           type: string
           enum: [factual_correction, defamation_takedown, copyright_takedown, privacy_grievance]
+          default: factual_correction
+        contact_email:
+          type: [string, 'null']
+          format: email
         requester_contact_email:
-          type: string
+          type: [string, 'null']
           format: email
         description:
           type: string
@@ -1103,15 +1107,22 @@ components:
         supporting_citation:
           type: [string, 'null']
           maxLength: 1000
-        website:
+        honeypot_field:
           type: string
           maxLength: 200
           description: Hidden anti-spam honeypot field; legitimate clients leave empty.
+        website:
+          type: string
+          maxLength: 200
+          description: Legacy alias for hidden anti-spam honeypot field; legitimate clients leave empty.
 
     CorrectionCreateResponse:
       type: object
-      required: [ticket_id, status, created_at]
+      required: [correction_id, ticket_id, status, created_at]
       properties:
+        correction_id:
+          type: string
+          format: uuid
         ticket_id:
           type: string
         status:

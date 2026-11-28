@@ -16,6 +16,7 @@ import (
 	"github.com/mahitss/evidence_architecture/backend-go/internal/config"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/handlers"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/queue"
+	"github.com/mahitss/evidence_architecture/backend-go/internal/search"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/server/middleware"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/storage"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/store"
@@ -37,7 +38,7 @@ type Server struct {
 }
 
 // New constructs a Server using LocalStorage (from cfg.LocalStorageRoot) and a nil queue
-// publisher if none is supplied explicitly. Use NewWithDeps when wiring Redis Streams publishing.
+// publisher if none is supplied explicitly. Use NewWithDeps or NewWithAllDeps when wiring Redis/Meilisearch.
 func New(cfg config.Config, st *store.Store) (*Server, error) {
 	ls, err := storage.NewLocalStorage(cfg.LocalStorageRoot)
 	if err != nil {
@@ -47,7 +48,7 @@ func New(cfg config.Config, st *store.Store) (*Server, error) {
 }
 
 // NewWithDeps constructs a Server with explicit Storage and EvidencePublisher dependencies.
-// If publisher exposes a *redis.Client, RedisIdempotencyStore is wired automatically.
+// If publisher exposes a *redis.Client, RedisIdempotencyStore and RedisRateLimiter are wired automatically.
 func NewWithDeps(
 	cfg config.Config,
 	st *store.Store,
@@ -55,23 +56,48 @@ func NewWithDeps(
 	publisher queue.EvidencePublisher,
 ) (*Server, error) {
 	var idemStore middleware.IdempotencyStore
+	var rateLimiter middleware.RateLimiter
 	if provider, ok := publisher.(redisClientProvider); ok && provider != nil {
 		if rc := provider.Client(); rc != nil {
 			idemStore = middleware.NewRedisIdempotencyStore(rc)
+			rateLimiter = middleware.NewRedisRateLimiter(rc)
 		}
 	}
-	return NewWithIdempotency(cfg, st, objStorage, publisher, idemStore)
+	return NewWithAllDeps(cfg, st, objStorage, publisher, idemStore, nil, rateLimiter)
 }
 
 // NewWithIdempotency constructs a Server with explicit Storage, EvidencePublisher, and IdempotencyStore dependencies.
-// Middleware order: requestid -> logging -> recoverer -> errorenvelope -> router
-// (JWT on protected /api/v1/admin/* endpoints; Idempotency-Key strictly on mutating write endpoints).
 func NewWithIdempotency(
 	cfg config.Config,
 	st *store.Store,
 	objStorage storage.Storage,
 	publisher queue.EvidencePublisher,
 	idemStore middleware.IdempotencyStore,
+) (*Server, error) {
+	var rateLimiter middleware.RateLimiter
+	if provider, ok := publisher.(redisClientProvider); ok && provider != nil {
+		if rc := provider.Client(); rc != nil {
+			rateLimiter = middleware.NewRedisRateLimiter(rc)
+		}
+	}
+	return NewWithAllDeps(cfg, st, objStorage, publisher, idemStore, nil, rateLimiter)
+}
+
+// NewWithAllDeps constructs a Server with all runtime dependencies including Meilisearch indexing
+// and rate limiting.
+// Middleware order:
+//   - Global: requestid -> logging -> recoverer -> errorenvelope
+//   - Reader routes (/api/v1/cases*, /api/v1/evidence*, /api/v1/search, /api/v1/corrections):
+//     Geoblock FIRST (EU/EEA/UK -> HTTP 451 before touching rate limits) -> RateLimit -> (Idempotency on POST /corrections)
+//   - Admin routes (/api/v1/admin/*) and /health: NO Geoblock (admins operate from any region)
+func NewWithAllDeps(
+	cfg config.Config,
+	st *store.Store,
+	objStorage storage.Storage,
+	publisher queue.EvidencePublisher,
+	idemStore middleware.IdempotencyStore,
+	searchIndexer search.Indexer,
+	rateLimiter middleware.RateLimiter,
 ) (*Server, error) {
 	if st == nil {
 		return nil, errors.New("store must not be nil")
@@ -82,6 +108,9 @@ func NewWithIdempotency(
 			return nil, fmt.Errorf("init default local storage: %w", err)
 		}
 		objStorage = ls
+	}
+	if rateLimiter == nil {
+		rateLimiter = middleware.NewMemoryRateLimiter()
 	}
 
 	level, err := zerolog.ParseLevel(cfg.LogLevel)
@@ -104,9 +133,10 @@ func NewWithIdempotency(
 		logger,
 	)
 	adminCasesHandler := handlers.NewAdminCasesHandler(st.Cases, st.LegalReviews, st.Evidence, objStorage)
-	adminCaseWriteHandler := handlers.NewAdminCaseWriteHandler(st.Cases)
-	adminEvidenceWriteHandler := handlers.NewAdminEvidenceWriteHandler(st.Evidence, objStorage, publisher, logger)
-	adminPublishHandler := handlers.NewAdminPublishHandler(st.LegalReviews, st.Cases)
+	adminCaseWriteHandler := handlers.NewAdminCaseWriteHandler(st.Cases).WithIndexer(searchIndexer)
+	adminEvidenceWriteHandler := handlers.NewAdminEvidenceWriteHandler(st.Evidence, objStorage, publisher, logger).WithIndexer(searchIndexer)
+	adminPublishHandler := handlers.NewAdminPublishHandler(st.LegalReviews, st.Cases).WithIndexer(searchIndexer)
+	readerHandler := handlers.NewReaderHandler(st.Cases, st.Evidence, st.Corrections, objStorage, searchIndexer)
 
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
@@ -121,39 +151,78 @@ func NewWithIdempotency(
 		middleware.WriteError(w, req, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 	})
 
-	// Public health probe (no auth)
+	// Public health probe (no auth, no geoblock)
 	r.Get("/health", healthHandler.ServeHTTP)
 
-	// NOTE: When POST /api/v1/corrections is added in Prompt 8e, wrap it with middleware.Idempotency(idemStore).
+	// Public anonymous reader API routes (NO auth per ADR-007; Geoblock FIRST, then per-route RateLimit)
+	r.Route("/api/v1", func(pub chi.Router) {
+		pub.Group(func(reader chi.Router) {
+			reader.Use(middleware.Geoblock)
 
-	// Admin API routes
-	r.Route("/api/v1/admin", func(ar chi.Router) {
-		// Unauthenticated login endpoint with in-memory IP rate limit (not idempotent)
-		ar.Post("/login", authHandler.Login)
+			reader.With(middleware.RateLimit(rateLimiter, middleware.RateLimitConfig{
+				Bucket: "cases_list",
+				Limit:  60,
+				Window: 60,
+			})).Get("/cases", readerHandler.ListCases)
 
-		// JWT-protected admin routes
-		ar.Group(func(protected chi.Router) {
-			protected.Use(middleware.RequireAdminJWT(jwtManager))
+			reader.With(middleware.RateLimit(rateLimiter, middleware.RateLimitConfig{
+				Bucket: "case_detail",
+				Limit:  60,
+				Window: 60,
+			})).Get("/cases/{slug}", readerHandler.GetCaseBySlug)
 
-			// Read-only admin routes (no Idempotency-Key required)
-			protected.Get("/cases/{id}", adminCasesHandler.GetByID)
+			reader.With(middleware.RateLimit(rateLimiter, middleware.RateLimitConfig{
+				Bucket: "evidence_detail",
+				Limit:  120,
+				Window: 60,
+			})).Get("/evidence/{id}", readerHandler.GetEvidenceByID)
 
-			// Mutating admin write routes (Idempotency-Key middleware enforced on all 7 endpoints)
-			protected.Group(func(idempotent chi.Router) {
-				idempotent.Use(middleware.Idempotency(idemStore))
+			reader.With(middleware.RateLimit(rateLimiter, middleware.RateLimitConfig{
+				Bucket: "search",
+				Limit:  30,
+				Window: 60,
+			})).Get("/search", readerHandler.Search)
 
-				// Cases
-				idempotent.Post("/cases", adminCaseWriteHandler.Create)
-				idempotent.Put("/cases/{id}", adminCaseWriteHandler.Update)
-				idempotent.Post("/cases/{id}/retract", adminCaseWriteHandler.Retract)
+			reader.With(
+				middleware.RateLimit(rateLimiter, middleware.RateLimitConfig{
+					Bucket:     "corrections",
+					Limit:      3,
+					Window:     3600,
+					FailClosed: true,
+				}),
+				middleware.Idempotency(idemStore),
+			).Post("/corrections", readerHandler.SubmitCorrection)
+		})
 
-				// Evidence
-				idempotent.Post("/cases/{id}/evidence", adminEvidenceWriteHandler.Upload)
-				idempotent.Put("/evidence/{id}", adminEvidenceWriteHandler.UpdateMetadata)
+		// Admin API routes (NO Geoblock — authorized admins may operate from any region)
+		pub.Route("/admin", func(ar chi.Router) {
+			// Unauthenticated login endpoint with in-memory IP rate limit (not idempotent)
+			ar.Post("/login", authHandler.Login)
 
-				// Legal review & publish gate
-				idempotent.Post("/cases/{id}/legal-review", adminPublishHandler.RecordLegalReview)
-				idempotent.Post("/cases/{id}/publish", adminPublishHandler.Publish)
+			// JWT-protected admin routes
+			ar.Group(func(protected chi.Router) {
+				protected.Use(middleware.RequireAdminJWT(jwtManager))
+
+				// Read-only admin routes (no Idempotency-Key required)
+				protected.Get("/cases/{id}", adminCasesHandler.GetByID)
+
+				// Mutating admin write routes (Idempotency-Key middleware enforced on all 7 endpoints)
+				protected.Group(func(idempotent chi.Router) {
+					idempotent.Use(middleware.Idempotency(idemStore))
+
+					// Cases
+					idempotent.Post("/cases", adminCaseWriteHandler.Create)
+					idempotent.Put("/cases/{id}", adminCaseWriteHandler.Update)
+					idempotent.Post("/cases/{id}/retract", adminCaseWriteHandler.Retract)
+
+					// Evidence
+					idempotent.Post("/cases/{id}/evidence", adminEvidenceWriteHandler.Upload)
+					idempotent.Put("/evidence/{id}", adminEvidenceWriteHandler.UpdateMetadata)
+
+					// Legal review & publish gate
+					idempotent.Post("/cases/{id}/legal-review", adminPublishHandler.RecordLegalReview)
+					idempotent.Post("/cases/{id}/publish", adminPublishHandler.Publish)
+				})
 			})
 		})
 	})

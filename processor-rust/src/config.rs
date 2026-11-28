@@ -19,6 +19,9 @@ pub struct Config {
     pub log_level: String,
     pub worker_count: usize,
     pub health_addr: String,
+    pub meili_url: Option<String>,
+    pub meili_api_key: Option<String>,
+    pub meili_index: Option<String>,
 }
 
 impl Config {
@@ -76,6 +79,23 @@ impl Config {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| DEFAULT_HEALTH_ADDR.to_string());
 
+        let meili_url = lookup("MEILI_URL")
+            .or_else(|| lookup("MEILISEARCH_URL"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if let Some(ref url) = meili_url {
+            validate_loopback_url("MEILI_URL", url, &["http", "https"])?;
+        }
+
+        let meili_api_key = lookup("MEILI_API_KEY")
+            .or_else(|| lookup("MEILI_MASTER_KEY"))
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        let meili_index = lookup("MEILI_INDEX")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
         Ok(Self {
             redis_url,
             database_url,
@@ -83,6 +103,9 @@ impl Config {
             log_level,
             worker_count,
             health_addr,
+            meili_url,
+            meili_api_key,
+            meili_index,
         })
     }
 }

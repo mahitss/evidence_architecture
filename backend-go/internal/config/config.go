@@ -20,6 +20,7 @@ const (
 	DefaultVersion          = "0.1.0"
 	DefaultLoginRatePerMin  = 5
 	DefaultRedisURL         = "redis://127.0.0.1:6379/0"
+	DefaultMeiliURL         = "http://127.0.0.1:7700"
 	DefaultLocalStorageRoot = "./data/evidence"
 	RequiredLoopbackHost    = "127.0.0.1"
 )
@@ -28,6 +29,8 @@ const (
 type Config struct {
 	DatabaseURL          string
 	RedisURL             string
+	MeiliURL             string
+	MeiliAPIKey          string
 	LocalStorageRoot     string
 	JWTSecret            string
 	ListenAddr           string
@@ -64,6 +67,21 @@ func LoadFromLookup(lookup func(string) string) (Config, error) {
 		redisURL = DefaultRedisURL
 	} else if err := ValidateLoopbackRedisURL(redisURL); err != nil {
 		errs = append(errs, err.Error())
+	}
+
+	meiliURL := strings.TrimSpace(lookup("MEILI_URL"))
+	if meiliURL == "" {
+		meiliURL = strings.TrimSpace(lookup("MEILISEARCH_URL"))
+	}
+	if meiliURL == "" {
+		meiliURL = DefaultMeiliURL
+	} else if err := ValidateLoopbackMeiliURL(meiliURL); err != nil {
+		errs = append(errs, err.Error())
+	}
+
+	meiliAPIKey := strings.TrimSpace(lookup("MEILI_API_KEY"))
+	if meiliAPIKey == "" {
+		meiliAPIKey = strings.TrimSpace(lookup("MEILISEARCH_API_KEY"))
 	}
 
 	localStorageRoot := strings.TrimSpace(lookup("LOCAL_STORAGE_ROOT"))
@@ -135,6 +153,8 @@ func LoadFromLookup(lookup func(string) string) (Config, error) {
 	return Config{
 		DatabaseURL:          dbURL,
 		RedisURL:             redisURL,
+		MeiliURL:             meiliURL,
+		MeiliAPIKey:          meiliAPIKey,
 		LocalStorageRoot:     localStorageRoot,
 		JWTSecret:            jwtSecret,
 		ListenAddr:           listenAddr,
@@ -173,6 +193,22 @@ func ValidateLoopbackRedisURL(rawURL string) error {
 	host := parsed.Hostname()
 	if host != RequiredLoopbackHost {
 		return fmt.Errorf("refusing to connect: REDIS_URL host %q must be %s (local loopback guard)", host, RequiredLoopbackHost)
+	}
+	return nil
+}
+
+// ValidateLoopbackMeiliURL enforces that MEILI_URL targets 127.0.0.1 locally.
+func ValidateLoopbackMeiliURL(rawURL string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("MEILI_URL is not a valid URL: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("MEILI_URL scheme %q must be http or https", parsed.Scheme)
+	}
+	host := parsed.Hostname()
+	if host != RequiredLoopbackHost {
+		return fmt.Errorf("refusing to connect: MEILI_URL host %q must be %s (local loopback guard)", host, RequiredLoopbackHost)
 	}
 	return nil
 }

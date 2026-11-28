@@ -425,6 +425,85 @@ CARGO_BUILD_JOBS=2 cargo test --all -- --nocapture
 CARGO_BUILD_JOBS=2 cargo build --release
 ```
 
+---
 
+## 11. Running Meilisearch locally
 
+Full-text search across published cases and extracted PDF/OCR evidence text uses self-hosted **Meilisearch** (`v1.12.8`, pinned for Debian 12 `GLIBC 2.36` compatibility; see `docs/23-decisions/ADR-019-meilisearch-index-schema.md` and `docs/24-setup/KNOWN_ENV_LIMITATIONS.md` §8).
 
+### Start & Stop Meilisearch
+
+```bash
+# Downloads Meilisearch v1.12.8 to ./data/meili/meilisearch-bin on first run and starts on 127.0.0.1:7700
+make meili-up
+
+# Verify health
+curl -s http://127.0.0.1:7700/health
+# Expected: {"status":"available"}
+
+# Stop Meilisearch cleanly
+make meili-down
+```
+
+> **LOCAL DEVELOPMENT ONLY:** `make meili-up` binds strictly to `127.0.0.1:7700` and refuses any non-loopback `MEILI_HOST`. In staging/production, set `MEILI_API_KEY` (search/admin key) and keep Meilisearch on a private network interface.
+
+### Additional Environment Variables (`backend-go` and `processor-rust`)
+
+| Variable | Service | Default | Notes |
+|---|---|---|---|
+| `MEILI_URL` | `backend-go` | `http://127.0.0.1:7700` | Must use `127.0.0.1` host locally (loopback guard enforced at startup) |
+| `MEILI_API_KEY` | `backend-go`, `processor-rust` | *(empty in local dev)* | Optional locally; **required** in staging/production |
+| `MEILI_URL` | `processor-rust` | *(unset / disabled)* | Optional; when set (e.g. `http://127.0.0.1:7700`), refreshes `PUBLISHED` case documents in place upon evidence completion |
+
+---
+
+## 12. Reader API curl examples (anonymous, geoblocked)
+
+All public reader endpoints require **no authentication** (`ADR-007`), enforce **EU/EEA/UK geoblocking (`HTTP 451`) before rate limiting** (`ADR-008`), and expose **only `PUBLISHED` cases and their evidence**.
+
+### 12.1 List published cases (`60 req/min per IP`)
+
+```bash
+curl -sS "http://127.0.0.1:8080/api/v1/cases?category=financial_crime&limit=20" | jq .
+```
+
+### 12.2 Get published case dossier by slug (`60 req/min per IP`)
+
+```bash
+curl -sS "http://127.0.0.1:8080/api/v1/cases/us-sec-demo-2026" | jq .
+# Note: DRAFT, IN_REVIEW, APPROVED, RETRACTED, and unknown slugs all return uniform HTTP 404.
+```
+
+### 12.3 Get published evidence detail + signed file URL (`120 req/min per IP`)
+
+```bash
+curl -sS "http://127.0.0.1:8080/api/v1/evidence/$EVIDENCE_ID" | jq .
+```
+
+### 12.4 Full-text search across published cases & extracted PDF text (`30 req/min per IP`)
+
+```bash
+curl -sS "http://127.0.0.1:8080/api/v1/search?q=clearinghouse&category=financial_crime" | jq .
+```
+
+### 12.5 Submit anonymous correction / takedown request (`3 req/hr per IP`, `Idempotency-Key` required)
+
+```bash
+curl -i -sS -X POST "http://127.0.0.1:8080/api/v1/corrections" \
+  -H "Content-Type: application/json" \
+  -H "Idempotency-Key: reader-correction-demo-0001" \
+  -d '{
+    "case_slug": "us-sec-demo-2026",
+    "description": "Exhibit filing date in paragraph two should read 2024-08-17.",
+    "contact_email": "reader@example.org",
+    "honeypot_field": ""
+  }'
+# Expected HTTP 202: {"correction_id":"...","ticket_id":"COR-...","status":"OPEN","created_at":"..."}
+```
+
+### 12.6 Verify EU/EEA/UK geoblock (`HTTP 451`)
+
+```bash
+curl -i -sS -H "CF-IPCountry: DE" "http://127.0.0.1:8080/api/v1/cases"
+# Expected HTTP 451 Unavailable For Legal Reasons with static HTML ("Not available in your region")
+```

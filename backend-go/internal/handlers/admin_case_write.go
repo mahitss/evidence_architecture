@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/models"
+	"github.com/mahitss/evidence_architecture/backend-go/internal/search"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/server/middleware"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/store"
 )
@@ -34,12 +35,19 @@ type CaseWriter interface {
 
 // AdminCaseWriteHandler serves POST /cases, PUT /cases/{id}, and POST /cases/{id}/retract.
 type AdminCaseWriteHandler struct {
-	cases CaseWriter
+	cases   CaseWriter
+	indexer search.Indexer
 }
 
 // NewAdminCaseWriteHandler creates an AdminCaseWriteHandler.
 func NewAdminCaseWriteHandler(cases CaseWriter) *AdminCaseWriteHandler {
 	return &AdminCaseWriteHandler{cases: cases}
+}
+
+// WithIndexer attaches a synchronous search indexer so retracted cases are immediately deleted from Meilisearch.
+func (h *AdminCaseWriteHandler) WithIndexer(indexer search.Indexer) *AdminCaseWriteHandler {
+	h.indexer = indexer
+	return h
 }
 
 type createCaseRequest struct {
@@ -300,6 +308,13 @@ func (h *AdminCaseWriteHandler) Retract(w http.ResponseWriter, r *http.Request) 
 		}
 		middleware.WriteError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "failed to retract case")
 		return
+	}
+
+	if h.indexer != nil {
+		if err := h.indexer.DeleteCase(r.Context(), retracted.ID); err != nil {
+			middleware.WriteError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "case retracted in database but failed to remove from search index")
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, retracted)

@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/models"
+	"github.com/mahitss/evidence_architecture/backend-go/internal/search"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/server/middleware"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/store"
 )
@@ -25,10 +26,19 @@ type CasePublisher interface {
 	Publish(ctx context.Context, id, actorID uuid.UUID) (*models.Case, error)
 }
 
+type casePublishWithHooker interface {
+	PublishWithHook(
+		ctx context.Context,
+		id, actorID uuid.UUID,
+		postUpdateFn func(ctx context.Context, published *models.Case, items []*models.EvidenceItem) error,
+	) (*models.Case, error)
+}
+
 // AdminPublishHandler serves POST /cases/{id}/legal-review and POST /cases/{id}/publish.
 type AdminPublishHandler struct {
 	reviews LegalReviewWriter
 	cases   CasePublisher
+	indexer search.Indexer
 }
 
 // NewAdminPublishHandler constructs an AdminPublishHandler.
@@ -37,6 +47,12 @@ func NewAdminPublishHandler(reviews LegalReviewWriter, cases CasePublisher) *Adm
 		reviews: reviews,
 		cases:   cases,
 	}
+}
+
+// WithIndexer attaches a synchronous Meilisearch indexer so publishing fails atomically if indexing fails.
+func (h *AdminPublishHandler) WithIndexer(indexer search.Indexer) *AdminPublishHandler {
+	h.indexer = indexer
+	return h
 }
 
 type recordLegalReviewRequest struct {
@@ -110,7 +126,9 @@ func (h *AdminPublishHandler) RecordLegalReview(w http.ResponseWriter, r *http.R
 // Publish handles POST /api/v1/admin/cases/{id}/publish.
 // Intentionally delegates precondition enforcement to the PostgreSQL trigger
 // enforce_legal_review_before_publish (single source of truth) and surfaces any trigger
-// or constraint rejection verbatim as HTTP 422.
+// or constraint rejection verbatim as HTTP 422. When a search indexer is configured,
+// synchronous Meilisearch indexing runs before transaction commit; if indexing fails,
+// the publish is rolled back and HTTP 503 is returned.
 func (h *AdminPublishHandler) Publish(w http.ResponseWriter, r *http.Request) {
 	actorID, ok := adminActorIDFromRequest(w, r)
 	if !ok {
@@ -123,7 +141,22 @@ func (h *AdminPublishHandler) Publish(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	published, err := h.cases.Publish(r.Context(), caseID, actorID)
+	var published *models.Case
+	if h.indexer != nil {
+		if hooker, ok := h.cases.(casePublishWithHooker); ok {
+			published, err = hooker.PublishWithHook(r.Context(), caseID, actorID, func(ctx context.Context, pubCase *models.Case, items []*models.EvidenceItem) error {
+				return h.indexer.IndexCaseDocument(ctx, pubCase, items)
+			})
+		} else {
+			published, err = h.cases.Publish(r.Context(), caseID, actorID)
+			if err == nil {
+				err = h.indexer.IndexCase(r.Context(), published.ID)
+			}
+		}
+	} else {
+		published, err = h.cases.Publish(r.Context(), caseID, actorID)
+	}
+
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			middleware.WriteError(w, r, http.StatusNotFound, "NOT_FOUND", "case not found")

@@ -17,6 +17,7 @@ use crate::db::Db;
 use crate::dlq::{publish_dead_letter, DeadLetterEntry};
 use crate::error::ProcessorError;
 use crate::extract::ExtractedDocument;
+use crate::meili::MeiliUpdater;
 use crate::processor::DocumentProcessor;
 
 pub const EVIDENCE_PROCESS_STREAM: &str = "evidence.process";
@@ -135,16 +136,27 @@ pub trait ConsumerBackend: Send + Sync {
     fn xack(&self, msg_id: &str) -> BoxFuture<'_, Result<()>>;
 }
 
-/// Production backend backed by real local PostgreSQL (`sqlx`) and Redis 7 (`redis`).
+/// Production backend backed by real local PostgreSQL (`sqlx`), Redis 7 (`redis`),
+/// and optional Meilisearch updater for in-place refreshes of published cases.
 #[derive(Clone)]
 pub struct RedisPostgresBackend {
     db: Db,
     redis_conn: MultiplexedConnection,
+    meili: Option<MeiliUpdater>,
 }
 
 impl RedisPostgresBackend {
     pub fn new(db: Db, redis_conn: MultiplexedConnection) -> Self {
-        Self { db, redis_conn }
+        Self {
+            db,
+            redis_conn,
+            meili: None,
+        }
+    }
+
+    pub fn with_meili(mut self, meili: Option<MeiliUpdater>) -> Self {
+        self.meili = meili;
+        self
     }
 }
 
@@ -194,7 +206,42 @@ impl ConsumerBackend for RedisPostgresBackend {
         job_id: Uuid,
         doc: ExtractedDocument,
     ) -> BoxFuture<'_, Result<()>> {
-        Box::pin(async move { self.db.mark_completed(evidence_id, job_id, &doc).await })
+        Box::pin(async move {
+            self.db.mark_completed(evidence_id, job_id, &doc).await?;
+            if let Some(ref meili) = self.meili {
+                match self
+                    .db
+                    .fetch_published_case_search_document_for_evidence(evidence_id)
+                    .await
+                {
+                    Ok(Some(case_doc)) => {
+                        if let Err(err) = meili.upsert_case_document(&case_doc).await {
+                            warn!(
+                                evidence_id = %evidence_id,
+                                case_id = %case_doc.id,
+                                error = %err,
+                                "failed to refresh published case document in Meilisearch after evidence extraction"
+                            );
+                        } else {
+                            info!(
+                                evidence_id = %evidence_id,
+                                case_id = %case_doc.id,
+                                "refreshed published case document in Meilisearch in place"
+                            );
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(
+                            evidence_id = %evidence_id,
+                            error = %err,
+                            "failed to check parent case publish state for Meilisearch refresh"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 
     fn mark_failed_permanent(
@@ -538,6 +585,18 @@ pub async fn run_worker_loop(
     redis_client: redis::Client,
     db: Db,
     processor: Arc<DocumentProcessor>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    run_worker_loop_with_meili(worker_index, redis_client, db, processor, None, shutdown_rx).await
+}
+
+/// Runs a single worker consumer loop with optional Meilisearch in-place updates on published cases.
+pub async fn run_worker_loop_with_meili(
+    worker_index: usize,
+    redis_client: redis::Client,
+    db: Db,
+    processor: Arc<DocumentProcessor>,
+    meili: Option<MeiliUpdater>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "local".to_string());
@@ -549,7 +608,7 @@ pub async fn run_worker_loop(
         .context("connect worker to Redis")?;
     ensure_consumer_group(&mut conn).await?;
 
-    let backend = RedisPostgresBackend::new(db, conn.clone());
+    let backend = RedisPostgresBackend::new(db, conn.clone()).with_meili(meili);
 
     info!(
         consumer = %consumer_name,

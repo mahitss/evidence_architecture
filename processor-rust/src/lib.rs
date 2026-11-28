@@ -5,6 +5,7 @@ pub mod dlq;
 pub mod error;
 pub mod extract;
 pub mod health;
+pub mod meili;
 pub mod ocr;
 pub mod pdf;
 pub mod processor;

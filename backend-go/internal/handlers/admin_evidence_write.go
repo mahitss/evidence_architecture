@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/models"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/queue"
+	"github.com/mahitss/evidence_architecture/backend-go/internal/search"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/server/middleware"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/storage"
 	"github.com/mahitss/evidence_architecture/backend-go/internal/store"
@@ -61,6 +62,7 @@ type AdminEvidenceWriteHandler struct {
 	evidence  EvidenceWriter
 	storage   storage.Storage
 	publisher queue.EvidencePublisher
+	indexer   search.Indexer
 	logger    zerolog.Logger
 }
 
@@ -77,6 +79,12 @@ func NewAdminEvidenceWriteHandler(
 		publisher: publisher,
 		logger:    logger,
 	}
+}
+
+// WithIndexer attaches a search indexer so demoting a PUBLISHED case on evidence update removes it from search.
+func (h *AdminEvidenceWriteHandler) WithIndexer(indexer search.Indexer) *AdminEvidenceWriteHandler {
+	h.indexer = indexer
+	return h
 }
 
 type uploadEvidenceResponse struct {
@@ -489,6 +497,15 @@ func (h *AdminEvidenceWriteHandler) UpdateMetadata(w http.ResponseWriter, r *htt
 		}
 		middleware.WriteError(w, r, http.StatusServiceUnavailable, "SERVICE_UNAVAILABLE", "failed to update evidence metadata")
 		return
+	}
+
+	if res.ReReviewTriggered && h.indexer != nil {
+		if delErr := h.indexer.DeleteCase(r.Context(), res.Evidence.CaseID); delErr != nil {
+			h.logger.Error().
+				Err(delErr).
+				Str("case_id", res.Evidence.CaseID.String()).
+				Msg("failed to delete demoted case from search index")
+		}
 	}
 
 	writeJSON(w, http.StatusOK, updateEvidenceResponse{

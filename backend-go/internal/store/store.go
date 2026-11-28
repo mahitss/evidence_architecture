@@ -27,6 +27,7 @@ type Store struct {
 	AdminUsers   *AdminUserStore
 	LegalReviews *LegalReviewStore
 	Evidence     *EvidenceStore
+	Corrections  *CorrectionStore
 	Audit        *AuditStore
 }
 
@@ -58,6 +59,7 @@ func New(ctx context.Context, databaseURL string) (*Store, error) {
 		AdminUsers:   &AdminUserStore{pool: pool},
 		LegalReviews: &LegalReviewStore{pool: pool, audit: audit},
 		Evidence:     &EvidenceStore{pool: pool, audit: audit},
+		Corrections:  &CorrectionStore{pool: pool, audit: audit},
 		Audit:        audit,
 	}, nil
 }

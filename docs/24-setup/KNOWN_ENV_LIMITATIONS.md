@@ -65,3 +65,11 @@ This document records verified constraints of the current sandboxed development 
   - **NEVER** use `git config --global credential.helper store` on a shared, persistent, or production host; use short-lived OAuth tokens, OS keychains, or SSH keys with passphrases instead.
   - Always rotate any Personal Access Token (PAT) pasted during interactive setup, and keep `*.git-credentials` in `.gitignore` as defense in depth.
   - Run `bash scripts/bootstrap-env.sh` at the start of any session after a container recycle.
+
+---
+
+## 8. Meilisearch Binary Download Requires Outbound Network (`make meili-up`)
+
+- **Fact:** `meilisearch` is not pre-installed in the sandbox image and cannot be installed via `apt-get` or Docker. `make meili-up` checks `command -v meilisearch` first and otherwise downloads the official `meilisearch-linux-amd64` release binary from GitHub Releases into `./data/meili/meilisearch-bin` (gitignored under `data/`).
+- **Mitigation:** Verified working in this sandbox (GitHub release asset download succeeds over HTTPS and persists under `/app/applet/data/meili/meilisearch-bin` across container restarts since `/app/applet` persists). In air-gapped environments without GitHub access, pre-place a `meilisearch` binary on `PATH` or at `./data/meili/meilisearch-bin` before running `make meili-up`.
+

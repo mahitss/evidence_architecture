@@ -148,4 +148,89 @@ impl Db {
             .context("commit permanent failure transaction")?;
         Ok(())
     }
+
+    /// Loads an ADR-019 Meilisearch case document for the parent case of `evidence_id`
+    /// ONLY when that parent case has `status = 'PUBLISHED'`. Returns `Ok(None)` for drafts/in-review/retracted cases.
+    pub async fn fetch_published_case_search_document_for_evidence(
+        &self,
+        evidence_id: Uuid,
+    ) -> Result<Option<crate::meili::CaseSearchDocument>> {
+        let case_row = sqlx::query(
+            r#"
+            SELECT
+                c.id,
+                c.slug,
+                c.title,
+                c.official_briefing,
+                c.status,
+                c.category,
+                COALESCE(to_char(c.published_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '') AS published_at_iso
+            FROM cases c
+            JOIN evidence_items e ON e.case_id = c.id
+            WHERE e.id = $1 AND c.status = 'PUBLISHED'
+            LIMIT 1
+            "#,
+        )
+        .bind(evidence_id)
+        .fetch_optional(&self.pool)
+        .await
+        .context("query parent published case for search refresh")?;
+
+        let Some(c) = case_row else {
+            return Ok(None);
+        };
+
+        let case_id: Uuid = c.get("id");
+        let ev_rows = sqlx::query(
+            r#"
+            SELECT title, extracted_text, source_type, is_redacted
+            FROM evidence_items
+            WHERE case_id = $1
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .bind(case_id)
+        .fetch_all(&self.pool)
+        .await
+        .context("query case evidence items for search refresh")?;
+
+        let evidence_count = ev_rows.len();
+        let mut titles = Vec::new();
+        let mut texts = Vec::new();
+        let mut source_types = Vec::new();
+        for row in ev_rows {
+            let is_redacted: bool = row.get("is_redacted");
+            if is_redacted {
+                continue;
+            }
+            let title: String = row.get("title");
+            if !title.trim().is_empty() {
+                titles.push(title);
+            }
+            let extracted: Option<String> = row.get("extracted_text");
+            if let Some(txt) = extracted {
+                if !txt.trim().is_empty() {
+                    texts.push(txt);
+                }
+            }
+            let st: String = row.get("source_type");
+            if !st.is_empty() && !source_types.contains(&st) {
+                source_types.push(st);
+            }
+        }
+
+        Ok(Some(crate::meili::CaseSearchDocument {
+            id: case_id.to_string(),
+            case_slug: c.get("slug"),
+            case_title: c.get("title"),
+            case_summary: c.get("official_briefing"),
+            status: c.get("status"),
+            category: c.get("category"),
+            published_at: c.get("published_at_iso"),
+            evidence_count,
+            evidence_titles: titles,
+            evidence_extracted_text: texts,
+            evidence_source_type: source_types,
+        }))
+    }
 }

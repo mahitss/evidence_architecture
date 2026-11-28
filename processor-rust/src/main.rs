@@ -40,6 +40,18 @@ async fn main() -> Result<()> {
         ocr_available,
     ));
 
+    let meili_updater = match cfg.meili_url {
+        Some(ref url) => Some(
+            processor_rust::meili::MeiliUpdater::new(
+                url,
+                cfg.meili_api_key.clone(),
+                cfg.meili_index.clone(),
+            )
+            .context("initialize Meilisearch updater")?,
+        ),
+        None => None,
+    };
+
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     info!(
@@ -47,6 +59,7 @@ async fn main() -> Result<()> {
         storage_root = %cfg.storage_root.display(),
         health_addr = %cfg.health_addr,
         ocr_available = ocr_available,
+        meili_enabled = meili_updater.is_some(),
         "starting processor-rust workers"
     );
 
@@ -64,10 +77,18 @@ async fn main() -> Result<()> {
         let rc = redis_client.clone();
         let db_clone = db.clone();
         let proc_clone = Arc::clone(&processor);
+        let meili_clone = meili_updater.clone();
         let rx = shutdown_rx.clone();
         worker_handles.push(tokio::spawn(async move {
-            if let Err(err) =
-                consumer::run_worker_loop(worker_idx, rc, db_clone, proc_clone, rx).await
+            if let Err(err) = consumer::run_worker_loop_with_meili(
+                worker_idx,
+                rc,
+                db_clone,
+                proc_clone,
+                meili_clone,
+                rx,
+            )
+            .await
             {
                 error!(worker = worker_idx, error = %err, "worker exited with error");
             }

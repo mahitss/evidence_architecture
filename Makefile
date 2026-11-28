@@ -34,9 +34,18 @@ REDIS_PID   := $(DATA_DIR)/redis/redis.pid
 REDIS_HOST  ?= 127.0.0.1
 REDIS_PORT  ?= 6379
 
+MEILI_DIR     := $(DATA_DIR)/meili
+MEILI_BIN     := $(MEILI_DIR)/meilisearch-bin
+MEILI_DB      := $(MEILI_DIR)/data.ms
+MEILI_PID     := $(MEILI_DIR)/meilisearch.pid
+MEILI_LOG     := $(DATA_DIR)/logs/meilisearch.log
+MEILI_HOST    ?= 127.0.0.1
+MEILI_PORT    ?= 7700
+MEILI_VERSION ?= v1.12.8
+
 SVC_USER    ?= appuser
 
-.PHONY: help env-check services-up services-down services-status db-reset clean
+.PHONY: help env-check services-up services-down services-status meili-up meili-down db-reset clean
 
 help: ## List available Makefile targets
 	@echo "True Crime Investigation App — Local Dev Makefile"
@@ -48,6 +57,8 @@ help: ## List available Makefile targets
 	@echo "  services-up      Start local PostgreSQL and Redis as $(SVC_USER) using ./data/"
 	@echo "  services-down    Stop local PostgreSQL and Redis gracefully"
 	@echo "  services-status  Check PostgreSQL (pg_ctl status) and Redis (redis-cli ping)"
+	@echo "  meili-up         Download (if needed) and start local Meilisearch on 127.0.0.1:7700"
+	@echo "  meili-down       Stop local Meilisearch gracefully"
 	@echo "  db-reset         Drop and recreate local dev database ($(PG_DB)) with confirmation"
 	@echo "  clean            Remove build artifacts (preserves ./data/)"
 
@@ -199,6 +210,69 @@ services-status: ## Show PostgreSQL and Redis status (exits non-zero if either i
 		exit 1; \
 	fi; \
 	echo "OK: Both PostgreSQL and Redis are running."
+
+meili-up: ## Start local Meilisearch on 127.0.0.1:7700 (downloads binary if absent)
+	@echo "==> Enforcing local-dev-only loopback and port guards for Meilisearch..."
+	@if [[ "$(MEILI_HOST)" != "127.0.0.1" ]]; then \
+		echo "ERROR: Refusing to start local Meilisearch on non-loopback host (MEILI_HOST='$(MEILI_HOST)'). Must be 127.0.0.1." >&2; \
+		exit 1; \
+	fi
+	@if [[ "$(MEILI_PORT)" != "7700" ]]; then \
+		echo "ERROR: Refusing to start local Meilisearch on non-standard local dev port (MEILI_PORT='$(MEILI_PORT)'). Must be 7700." >&2; \
+		exit 1; \
+	fi
+	@mkdir -p "$(MEILI_DIR)" "$(DATA_DIR)/logs"
+	@if curl -fsS "http://$(MEILI_HOST):$(MEILI_PORT)/health" >/dev/null 2>&1; then \
+		echo "Meilisearch is already running on http://$(MEILI_HOST):$(MEILI_PORT)."; \
+		exit 0; \
+	fi
+	@BIN="$$(command -v meilisearch || true)"; \
+	if [[ -z "$$BIN" ]]; then \
+		if [[ ! -x "$(MEILI_BIN)" ]]; then \
+			echo "==> Downloading Meilisearch $(MEILI_VERSION) Linux amd64 binary to $(MEILI_BIN)..."; \
+			curl -fsSL "https://github.com/meilisearch/meilisearch/releases/download/$(MEILI_VERSION)/meilisearch-linux-amd64" -o "$(MEILI_BIN).tmp"; \
+			chmod +x "$(MEILI_BIN).tmp"; \
+			mv "$(MEILI_BIN).tmp" "$(MEILI_BIN)"; \
+		fi; \
+		BIN="$(MEILI_BIN)"; \
+	fi; \
+	echo "==> Starting Meilisearch ($$BIN) on $(MEILI_HOST):$(MEILI_PORT)..."; \
+	if [[ "$$(id -u)" -eq 0 ]]; then \
+		chown -R "$(SVC_USER):$(SVC_USER)" "$(MEILI_DIR)" "$(DATA_DIR)/logs"; \
+		su -s /bin/bash "$(SVC_USER)" -c "nohup '$$BIN' --http-addr '$(MEILI_HOST):$(MEILI_PORT)' --db-path '$(MEILI_DB)' --env development --no-analytics >>'$(MEILI_LOG)' 2>&1 & echo \$$! > '$(MEILI_PID)'"; \
+	else \
+		nohup "$$BIN" --http-addr "$(MEILI_HOST):$(MEILI_PORT)" --db-path "$(MEILI_DB)" --env development --no-analytics >>"$(MEILI_LOG)" 2>&1 & echo $$! > "$(MEILI_PID)"; \
+	fi; \
+	for i in $$(seq 1 30); do \
+		if curl -fsS "http://$(MEILI_HOST):$(MEILI_PORT)/health" >/dev/null 2>&1; then \
+			echo "OK: Local Meilisearch is up at http://$(MEILI_HOST):$(MEILI_PORT)."; \
+			exit 0; \
+		fi; \
+		sleep 0.25; \
+	done; \
+	echo "ERROR: Meilisearch failed to become healthy within timeout. Check $(MEILI_LOG)." >&2; \
+	exit 1
+
+meili-down: ## Stop local Meilisearch gracefully
+	@echo "==> Stopping Meilisearch..."
+	@if [[ -f "$(MEILI_PID)" ]]; then \
+		PID="$$(cat "$(MEILI_PID)")"; \
+		if kill -0 "$$PID" 2>/dev/null; then \
+			kill "$$PID" 2>/dev/null || true; \
+			for i in $$(seq 1 20); do \
+				if ! kill -0 "$$PID" 2>/dev/null; then break; fi; \
+				sleep 0.2; \
+			done; \
+			if kill -0 "$$PID" 2>/dev/null; then kill -9 "$$PID" 2>/dev/null || true; fi; \
+			echo "Meilisearch stopped (PID $$PID)."; \
+		else \
+			echo "Meilisearch PID $$PID is not running."; \
+		fi; \
+		rm -f "$(MEILI_PID)"; \
+	else \
+		echo "Meilisearch is not running."; \
+	fi
+	@echo "OK: Meilisearch stopped."
 
 db-reset: ## Drop and recreate local dev database ($(PG_DB)) with confirmation prompt
 	@echo "==> Enforcing local-dev-only loopback and port guards for db-reset..."
